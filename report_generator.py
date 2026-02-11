@@ -32,6 +32,18 @@ class GearResult:
     output_torque: float
     width_factor1: float
     width_factor2: float
+    stress_details: dict = None
+    max_stress_gear: str = ""
+    gear_materials: dict = None
+    gear_material_names: dict = None
+    
+    def __post_init__(self):
+        if self.stress_details is None:
+            self.stress_details = {}
+        if self.gear_materials is None:
+            self.gear_materials = {}
+        if self.gear_material_names is None:
+            self.gear_material_names = {}
 
 
 @dataclass
@@ -115,7 +127,7 @@ class ReportGenerator:
     def _print_header(self):
         """打印报告头部"""
         print(f"\n╔{self.hline}╗")
-        print(f"║{'二级齿轮传动优化设计报告':^58}║")
+        print(f"║{'两级齿轮传动优化设计报告':^58}║")
         print(f"╚{self.hline}╝")
         
         opt_target = "纵向尺寸最短" if self.config.optimize_mode == 'size' else "重量最轻"
@@ -126,6 +138,12 @@ class ReportGenerator:
         """打印齿轮参数"""
         r = self.result
         
+        # 获取各齿轮材质名称
+        mat_z1 = r.gear_material_names.get('z1', '合金钢 (20CrMnTi)')
+        mat_z2 = r.gear_material_names.get('z2', '合金钢 (20CrMnTi)')
+        mat_z3 = r.gear_material_names.get('z3', '合金钢 (20CrMnTi)')
+        mat_z4 = r.gear_material_names.get('z4', '合金钢 (20CrMnTi)')
+        
         print(f"\n┌{'─' * 54}┐")
         print(f"│ {'第一级 (高速级)':^52} │")
         print(f"├{self.hline_blue}┤")
@@ -135,9 +153,11 @@ class ReportGenerator:
         print(f"│  危险截面齿根宽 sf1 = {self.sf1:.3f} mm (sf/m = {self.sf_factor:.3f})")
         print(f"│")
         print(f"│  主动轮: 齿数 z1 = {r.z1}, 分度圆直径 D1 = {r.d1:.2f} mm, 齿轮厚度 = {self.width1:.2f} mm")
+        print(f"│          材质: {mat_z1}")
         print(f"│          齿根圆直径 = {self.df1:.2f} mm")
         print(f"│          输入扭矩 = {self.T1_input:.3f} N·m")
         print(f"│  从动轮: 齿数 z2 = {r.z2}, 分度圆直径 D2 = {r.d2:.2f} mm, 齿轮厚度 = {self.width1:.2f} mm")
+        print(f"│          材质: {mat_z2}")
         print(f"│          齿根圆直径 = {self.df2:.2f} mm")
         print(f"│          输出扭矩 = {self.T1_output:.3f} N·m")
         print(f"│  传动比 i1 = {self.i1:.3f}")
@@ -150,9 +170,11 @@ class ReportGenerator:
         print(f"│  危险截面齿根宽 sf2 = {self.sf2:.3f} mm (sf/m = {self.sf_factor:.3f})")
         print(f"│")
         print(f"│  主动轮: 齿数 z3 = {r.z3}, 分度圆直径 D3 = {r.d3:.2f} mm, 齿轮厚度 = {self.width2:.2f} mm")
+        print(f"│          材质: {mat_z3}")
         print(f"│          齿根圆直径 = {self.df3:.2f} mm")
         print(f"│          输入扭矩 = {self.T2_input:.3f} N·m")
         print(f"│  从动轮: 齿数 z4 = {r.z4}, 分度圆直径 D4 = {r.d4:.2f} mm, 齿轮厚度 = {self.width2:.2f} mm")
+        print(f"│          材质: {mat_z4}")
         print(f"│          齿根圆直径 = {self.df4:.2f} mm")
         print(f"│          输出扭矩 = {self.T2_output:.3f} N·m")
         print(f"│  传动比 i2 = {self.i2:.3f}")
@@ -198,7 +220,7 @@ class ReportGenerator:
         print(f"│   D1/2 (一级主动轮半径): {r.d1/2:.2f} mm")
         print(f"│   D2/2 (一级从动轮半径): {r.d2/2:.2f} mm")
         print(f"│   D3/2 (二级主动轮半径): {r.d3/2:.2f} mm")
-        print(f"│   D4/2 (二级从动轮半径): {r.d4/2:.2f} mm")
+        print(f"│   D4 (二级从动轮直径): {r.d4:.2f} mm")
         print(f"│   {'总纵向尺寸:':<20} {r.total_size:.2f} mm {'← 优化指标' if c.optimize_mode == 'size' else ''}")
         print(f"│")
         print(f"│ 齿轮组重量: {r.weight_g:.1f} g")
@@ -214,10 +236,42 @@ class ReportGenerator:
         stress_ratio = r.max_stress / r.allow_stress
         stress_status = "✓ 安全" if stress_ratio < 1.0 else "✗ 超限"
         
+        # 解析最大应力位置
+        max_gear_name = r.max_stress_gear if r.max_stress_gear else "未知"
+        
         print(f"\n┌{'─' * 54}┐")
         print(f"│ {'材料强度校核':^52} │")
         print(f"├{self.hline_blue}┤")
         print(f"│ 选定材质: {r.material_name}")
+        print(f"│")
+        print(f"│ 【各齿轮弯曲应力详情】")
+        
+        # 打印各齿轮应力
+        if r.stress_details:
+            # 第一级啮合对
+            s1 = r.stress_details.get('z1(一级主动)', 0)
+            s2 = r.stress_details.get('z2(一级从动)', 0)
+            pair1_max = max(s1, s2)
+            marker1 = " ← 最大" if r.max_stress_gear in ['z1(一级主动)', 'z2(一级从动)'] else ""
+            print(f"│  第一级啮合 (z1-z2):")
+            print(f"│    z1 主动轮: {s1:.1f} MPa")
+            print(f"│    z2 从动轮: {s2:.1f} MPa")
+            print(f"│    啮合最大: {pair1_max:.1f} MPa{marker1}")
+            print(f"│")
+            
+            # 第二级啮合对
+            s3 = r.stress_details.get('z3(二级主动)', 0)
+            s4 = r.stress_details.get('z4(二级从动)', 0)
+            pair2_max = max(s3, s4)
+            marker2 = " ← 最大" if r.max_stress_gear in ['z3(二级主动)', 'z4(二级从动)'] else ""
+            print(f"│  第二级啮合 (z3-z4):")
+            print(f"│    z3 主动轮: {s3:.1f} MPa")
+            print(f"│    z4 从动轮: {s4:.1f} MPa")
+            print(f"│    啮合最大: {pair2_max:.1f} MPa{marker2}")
+        
+        print(f"│")
+        print(f"│ 【应力校核总结】")
+        print(f"│ 最大应力位置: {max_gear_name}")
         print(f"│ 最大弯曲应力: {r.max_stress:.1f} MPa")
         print(f"│ 许用弯曲应力: {r.allow_stress:.1f} MPa")
         print(f"│ 应力比: {stress_ratio:.2f} {stress_status}")
@@ -284,7 +338,11 @@ def print_result(result, config):
         total_size=result.total_size,
         output_torque=result.output_torque,
         width_factor1=result.width_factor1,
-        width_factor2=result.width_factor2
+        width_factor2=result.width_factor2,
+        stress_details=result.stress_details,
+        max_stress_gear=result.max_stress_gear,
+        gear_materials=result.gear_materials,
+        gear_material_names=result.gear_material_names
     )
     
     report_config = GearConfig(

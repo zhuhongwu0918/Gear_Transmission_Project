@@ -32,6 +32,19 @@ class MaterialCheckResult:
     suitable: bool
     safety_margin: float
     density: float
+    # 各齿轮应力详情 (齿轮编号, 应力值MPa)
+    stress_details: Dict[str, float] = None
+    # 混合材质配置 - 各齿轮实际使用的材质
+    gear_materials: Dict[str, str] = None  # 如 {'z1': 'steel', 'z2': 'peek', ...}
+    gear_material_names: Dict[str, str] = None  # 如 {'z1': '合金钢', 'z2': 'PEEK', ...}
+    
+    def __post_init__(self):
+        if self.stress_details is None:
+            self.stress_details = {}
+        if self.gear_materials is None:
+            self.gear_materials = {}
+        if self.gear_material_names is None:
+            self.gear_material_names = {}
 
 
 class MaterialDatabase:
@@ -50,8 +63,13 @@ class MaterialDatabase:
             name='PEEK (聚醚醚酮)',
             density=1.32e-6,
             sigma_f=90,
-            sf_min_ratio=0.8,
-            safety_factor=2.5,
+            # sf_min_ratio=0.8,
+            # 在高性能设计中，齿根厚系数可以降低到 0.65 - 0.7 左右，但建议不要盲目下探到 0.6 以下
+            # 优化的齿形： 如果你采用了大压力角（如25度 而不是标准的 20度）或者齿顶修缘，
+            # 齿根的自然厚度会增加，此时可以适当调小比例系数。
+            sf_min_ratio=0.3,#需要增加压力角（增加基部厚度）
+            # safety_factor=2.5,
+            safety_factor=2,
             color='米黄色'
         ),
         'pom': Material(
@@ -193,6 +211,14 @@ class StrengthChecker:
         sigma_F3, _ = self.calculate_bending_stress(m2, z3, width2, torque2)
         sigma_F4, _ = self.calculate_bending_stress(m2, z4, width2, torque2 * z4 / z3)
         
+        # 应力详情
+        stress_details = {
+            'z1(一级主动)': sigma_F1,
+            'z2(一级从动)': sigma_F2,
+            'z3(二级主动)': sigma_F3,
+            'z4(二级从动)': sigma_F4
+        }
+        
         # 最大弯曲应力
         max_sigma_F = max(sigma_F1, sigma_F2, sigma_F3, sigma_F4)
         
@@ -225,7 +251,8 @@ class StrengthChecker:
             sf_ratio_ok=sf_ratio_ok,
             suitable=is_suitable,
             safety_margin=safety_margin,
-            density=material.density
+            density=material.density,
+            stress_details=stress_details
         )
     
     def select_best_material(
@@ -283,6 +310,132 @@ class StrengthChecker:
             selected_key = 'steel'
         
         return selected_key, results
+    
+    def check_mixed_materials(
+        self,
+        db: MaterialDatabase,
+        m1: float,
+        m2: float,
+        z1: int, z2: int, z3: int, z4: int,
+        width1: float,
+        width2: float,
+        torque1: float,
+        torque2: float,
+        material_config: Dict[str, str]
+    ) -> MaterialCheckResult:
+        """
+        混合材质校核 - 各齿轮可使用不同材质
+        
+        Args:
+            db: 材料数据库
+            m1, m2: 第一/二级模数
+            z1-z4: 各齿轮齿数
+            width1, width2: 第一/二级齿宽
+            torque1: 第一级输入扭矩 (N·m)
+            torque2: 第二级输入扭矩 (N·m)
+            material_config: 材质配置字典, 如 {'z1': 'steel', 'z2': 'peek', ...}
+            
+        Returns:
+            MaterialCheckResult: 校核结果（综合各材质情况）
+        """
+        # 计算各齿轮扭矩
+        T1 = torque1
+        T2 = torque1 * z2 / z1  # z2承受的扭矩
+        T3 = torque2
+        T4 = torque2 * z4 / z3  # z4承受的扭矩
+        
+        # 各齿轮参数
+        gears = [
+            ('z1', m1, z1, width1, T1),
+            ('z2', m1, z2, width1, T2),
+            ('z3', m2, z3, width2, T3),
+            ('z4', m2, z4, width2, T4)
+        ]
+        
+        # 计算各齿轮应力和校核
+        stress_details = {}
+        gear_materials = {}
+        gear_material_names = {}
+        all_suitable = True
+        max_stress_ratio = 0
+        total_density_weighted = 0
+        
+        for gear_key, m, z, width, torque in gears:
+            # 获取该齿轮的材质
+            mat_key = material_config.get(gear_key, 'steel')
+            material = db.get(mat_key)
+            if material is None:
+                material = db['steel']  # 默认用钢
+            
+            # 计算应力
+            sigma_F, _ = self.calculate_bending_stress(m, z, width, torque)
+            stress_details[f'{gear_key}({self._get_gear_desc(gear_key)})'] = sigma_F
+            
+            # 许用应力
+            sigma_F_allow = material.sigma_f / material.safety_factor
+            
+            # 检查强度
+            strength_ok = sigma_F <= sigma_F_allow
+            
+            # 齿根厚检查
+            sf = m * self.sf_factor
+            sf_ok = (sf / m) >= material.sf_min_ratio
+            
+            gear_suitable = strength_ok and sf_ok
+            if not gear_suitable:
+                all_suitable = False
+            
+            # 记录材质信息
+            gear_materials[gear_key] = mat_key
+            gear_material_names[gear_key] = material.name
+            
+            # 计算最大应力比（用于评估整体安全裕度）
+            stress_ratio = sigma_F / sigma_F_allow if sigma_F_allow > 0 else float('inf')
+            max_stress_ratio = max(max_stress_ratio, stress_ratio)
+            
+            # 加权平均密度（按体积近似估算）
+            total_density_weighted += material.density * (z * width * m**2)
+        
+        # 最大应力
+        max_sigma_F = max(stress_details.values())
+        
+        # 取最严格的许用应力作为整体许用（保守估计）
+        min_allow_stress = min(
+            db[gear_materials[g]].sigma_f / db[gear_materials[g]].safety_factor 
+            for g in gear_materials
+        )
+        
+        # 综合安全裕度
+        safety_margin = 1.0 / max_stress_ratio if max_stress_ratio > 0 else float('inf')
+        
+        # 生成综合名称
+        unique_materials = list(set(gear_material_names.values()))
+        combined_name = " + ".join(unique_materials) if len(unique_materials) > 1 else unique_materials[0]
+        
+        return MaterialCheckResult(
+            material_key='mixed',
+            name=combined_name,
+            max_stress=max_sigma_F,
+            allow_stress=min_allow_stress,
+            strength_ok=all_suitable,
+            sf_ratio_ok=all_suitable,  # 已在各齿轮检查中包含
+            suitable=all_suitable,
+            safety_margin=safety_margin,
+            density=total_density_weighted / sum(z * width * m**2 for _, m, z, width, _ in gears),
+            stress_details=stress_details,
+            gear_materials=gear_materials,
+            gear_material_names=gear_material_names
+        )
+    
+    def _get_gear_desc(self, gear_key: str) -> str:
+        """获取齿轮描述"""
+        desc_map = {
+            'z1': '一级主动',
+            'z2': '一级从动',
+            'z3': '二级主动',
+            'z4': '二级从动'
+        }
+        return desc_map.get(gear_key, gear_key)
 
 
 # ==================== 便捷函数 ====================

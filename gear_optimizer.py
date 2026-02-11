@@ -23,9 +23,9 @@ class GearConfig:
     """齿轮设计配置"""
     # 性能约束
     motor_torque: float = 0.8      # 电机扭矩 (Nm)
-    output_torque: float = 4.0     # 输出扭矩要求 (Nm)
+    output_torque: float = 5.0     # 输出扭矩要求 (Nm)
     max_motor_speed: float = 4000  # 电机最大转速 (rpm)
-    output_speed: float = 250      # 输出转速 (rpm)
+    output_speed: float = 350      # 输出转速 (rpm)
     
     # 结构约束
     motor_diameter: float = 75     # 电机直径 (mm)
@@ -40,11 +40,20 @@ class GearConfig:
     step: int = 2                  # 扫描步长 (mm)
     
     # 模数选项
-    m1_options: tuple = (0.5, 0.8, 1.0)
+    m1_options: tuple = (1.0, 1.2) # 增大模数,增大齿根绝对厚度
     m2_options: tuple = (0.8, 1.0, 1.5)
     
-    # 齿宽系数列表 (常用值: 8, 10, 12)
-    width_factors: tuple = (8, 10, 12)
+    # 齿宽系数列表 (常用值: 6, 8, 10, 12, 15)，分别控制两级齿轮厚度
+    width_factors1: tuple = (10, 12, 15)  # 第一级齿宽系数（可以更大，因为第一级扭矩小）
+    width_factors2: tuple = (6, 8, 10)       # 第二级齿宽系数
+    
+    # 混合材质配置 - 可为每个齿轮指定不同材质
+    # 可选: 'steel'(钢), 'peek'(PEEK), 'pom'(POM), 'nylon'(尼龙)
+    # 默认: 全部用钢
+    material_z1: str = 'steel'  # 第一级主动轮
+    material_z2: str = 'steel'  # 第一级从动轮  <- 可改为 'peek' 使用塑料
+    material_z3: str = 'steel'  # 第二级主动轮
+    material_z4: str = 'steel'  # 第二级从动轮
     
     # 优化目标
     optimize_mode: str = 'size'    # 'size'或'weight'
@@ -77,6 +86,18 @@ class GearResult:
     output_torque: float
     width_factor1: float  # 第一级齿宽系数
     width_factor2: float  # 第二级齿宽系数
+    stress_details: Dict[str, float] = None  # 各齿轮应力详情
+    max_stress_gear: str = ""  # 最大应力所在齿轮
+    gear_materials: Dict[str, str] = None  # 各齿轮材质键名
+    gear_material_names: Dict[str, str] = None  # 各齿轮材质名称
+    
+    def __post_init__(self):
+        if self.stress_details is None:
+            self.stress_details = {}
+        if self.gear_materials is None:
+            self.gear_materials = {}
+        if self.gear_material_names is None:
+            self.gear_material_names = {}
 
 
 # ==================== 核心优化器 ====================
@@ -143,45 +164,74 @@ class GearOptimizer:
         if (d1 - d3) < cfg.min_clearance:
             return None
         
-        # 9. 材料校核
+        # 9. 材料校核（支持混合材质）
         width1 = wf1 * m1
         width2 = wf2 * m2
         torque1 = cfg.motor_torque
         torque2 = torque1 * i1 * 0.95
         
-        selected_key, results = self.strength_checker.select_best_material(
-            self.material_db, m1, m2, z1, z2, z3, z4,
-            width1, width2, torque1, torque2, mode='auto'
-        )
+        # 构建材质配置
+        material_config = {
+            'z1': cfg.material_z1,
+            'z2': cfg.material_z2,
+            'z3': cfg.material_z3,
+            'z4': cfg.material_z4
+        }
+        
+        # 检查是否使用混合材质
+        unique_materials = set(material_config.values())
+        if len(unique_materials) > 1:
+            # 使用混合材质校核
+            result = self.strength_checker.check_mixed_materials(
+                self.material_db, m1, m2, z1, z2, z3, z4,
+                width1, width2, torque1, torque2, material_config
+            )
+        else:
+            # 使用单一材质校核（原有逻辑）
+            selected_key, results = self.strength_checker.select_best_material(
+                self.material_db, m1, m2, z1, z2, z3, z4,
+                width1, width2, torque1, torque2, mode='auto'
+            )
+            result = results[selected_key]
         
         # 检查是否有材料满足
-        result = results[selected_key]
         if not result.suitable:
-            for key, res in results.items():
-                if res.suitable:
-                    selected_key = key
-                    result = res
-                    break
-            else:
-                return None  # 没有材料满足
+            return None  # 没有材料满足
         
-        # 10. 计算重量
-        vol = (
-            math.pi * (d1/2)**2 * width1 +
-            math.pi * (d2/2)**2 * width1 +
-            math.pi * (d3/2)**2 * width2 +
-            math.pi * (d4/2)**2 * width2
-        )
-        weight_g = 0.5 * vol * result.density * 1000
+        # 找出最大应力所在齿轮
+        max_stress_gear = max(result.stress_details.items(), key=lambda x: x[1])[0]
+        
+        # 10. 计算重量（各齿轮按实际材质密度计算）
+        if result.gear_materials:
+            # 混合材质：分别计算各齿轮重量
+            weight_g = 0
+            gears = [
+                (d1, width1, 'z1'), (d2, width1, 'z2'),
+                (d3, width2, 'z3'), (d4, width2, 'z4')
+            ]
+            for d, width, gear_key in gears:
+                mat_key = result.gear_materials.get(gear_key, 'steel')
+                material = self.material_db.get(mat_key) or self.material_db['steel']
+                vol = math.pi * (d/2)**2 * width
+                weight_g += 0.5 * vol * material.density * 1000
+        else:
+            # 单一材质
+            vol = (
+                math.pi * (d1/2)**2 * width1 +
+                math.pi * (d2/2)**2 * width1 +
+                math.pi * (d3/2)**2 * width2 +
+                math.pi * (d4/2)**2 * width2
+            )
+            weight_g = 0.5 * vol * result.density * 1000
         
         # 11. 纵向尺寸
-        total_size = cfg.motor_diameter/2 + d1/2 + d2/2 + d3/2 + d4
+        total_size = cfg.motor_diameter/2 + d1/2 + d2/2 + d3/2 + d4/2
         
         return GearResult(
             m1=m1, m2=m2, z1=z1, z2=z2, z3=z3, z4=z4,
             d1=d1, d2=d2, d3=d3, d4=d4,
             ratio=ratio,
-            material=selected_key,
+            material='mixed' if len(unique_materials) > 1 else list(unique_materials)[0],
             material_name=result.name,
             max_stress=result.max_stress,
             allow_stress=result.allow_stress,
@@ -189,7 +239,11 @@ class GearOptimizer:
             total_size=total_size,
             output_torque=actual_torque,
             width_factor1=wf1,
-            width_factor2=wf2
+            width_factor2=wf2,
+            stress_details=result.stress_details,
+            max_stress_gear=max_stress_gear,
+            gear_materials=result.gear_materials,
+            gear_material_names=result.gear_material_names
         )
     
     def optimize(self, progress_interval: int = 10000) -> tuple:
@@ -213,12 +267,13 @@ class GearOptimizer:
         total_count = (
             len(cfg.m1_options) * len(cfg.m2_options) *
             len(d1_list) * len(d2_list) * len(d3_list) * len(d4_list) *
-            len(cfg.width_factors) * len(cfg.width_factors)
+            len(cfg.width_factors1) * len(cfg.width_factors2)
         )
         
         print(f"搜索空间: {total_count:,} 种组合")
         print(f"步长: {cfg.step} mm")
-        print(f"齿宽系数选项: {cfg.width_factors}")
+        print(f"第一级齿宽系数: {cfg.width_factors1}")
+        print(f"第二级齿宽系数: {cfg.width_factors2}")
         print(f"优化目标: {'纵向尺寸最短' if cfg.optimize_mode == 'size' else '重量最轻'}")
         print()
         
@@ -235,8 +290,8 @@ class GearOptimizer:
                     for d2 in d2_list:
                         for d3 in d3_list:
                             for d4 in d4_list:
-                                for wf1 in cfg.width_factors:
-                                    for wf2 in cfg.width_factors:
+                                for wf1 in cfg.width_factors1:
+                                    for wf2 in cfg.width_factors2:
                                         result = self.evaluate(m1, m2, d1, d2, d3, d4, wf1, wf2)
                                         completed += 1
                                         
