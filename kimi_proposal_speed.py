@@ -115,8 +115,8 @@ width_factor1_fixed = 8   # 第一级齿宽系数
 width_factor2_fixed = 10  # 第二级齿宽系数 (低速级更宽)
 
 # 齿宽系数扫描范围 (当 OPTIMIZE_WIDTH_FACTOR = True 时使用)
-width_factor1_min, width_factor1_max = 6, 12   # 第一级齿宽系数范围
-width_factor2_min, width_factor2_max = 8, 16   # 第二级齿宽系数范围 (低速级更宽)
+width_factor1_min, width_factor1_max = 10, 15   # 第一级齿宽系数范围
+width_factor2_min, width_factor2_max = 10, 10   # 第二级齿宽系数范围 (低速级更宽)
 width_factor_step = 1                          # 齿宽系数步长 (整数)
 # 压力角
 gear_pressure_angle = 20  # 压力角 20度
@@ -342,6 +342,20 @@ def optimize_gear_design():
         width_factor1_options = [width_factor1_fixed]
         width_factor2_options = [width_factor2_fixed]
     
+    # 计算总搜索空间
+    total_combinations = (len(m1_options) * len(m2_options) * 
+                         len(width_factor1_options) * len(width_factor2_options) *
+                         ((D1_max - D1_min) // step + 1) * 
+                         ((D2_max - D2_min) // step + 1) *
+                         ((D3_max - D3_min) // step + 1) * 
+                         ((D4_max - D4_min) // step + 1))
+    print(f"{colorize('搜索空间:', Color.BRIGHT_YELLOW)} 约 {colorize(f'{total_combinations:,}', Color.BRIGHT_CYAN)} 种组合")
+    print(f"{colorize('进度显示:', Color.BRIGHT_YELLOW)} 每处理1000万组刷新一次...")
+    print()
+    
+    processed_count = 0
+    last_progress_print = 0
+    
     # 嵌套循环优化搜索
     for m1 in m1_options:
         for m2 in m2_options:
@@ -351,6 +365,11 @@ def optimize_gear_design():
                         for D2 in range(D2_min, D2_max + 1, step):
                             for D3 in range(D3_min, D3_max + 1, step):
                                     for D4 in range(D4_min, D4_max + 1, step):
+                                        # 进度计数
+                                        processed_count += 1
+                                        if processed_count - last_progress_print >= 10_000_000:  # 每1000万组显示一次
+                                            print(f"\r{colorize('进度:', Color.BRIGHT_YELLOW)} {colorize(f'{processed_count:,}', Color.BRIGHT_CYAN)} / {colorize(f'{total_combinations:,}', Color.BRIGHT_CYAN)} ({colorize(f'{processed_count/total_combinations*100:.1f}%', Color.BRIGHT_GREEN)})", end='', flush=True)
+                                            last_progress_print = processed_count
                                         
                                         # ----- 1. 计算并修正齿数 (齿数必须为整数) -----
                                         z1 = round(D1 / m1)
@@ -530,6 +549,11 @@ def optimize_gear_design():
                                                 strength_check_pass=mat_result.get('suitable', False),
                                                 material_check_results=mat_check_results
                                             )
+    
+    # 搜索完成，打印最终进度
+    if processed_count > 0:
+        print(f"\r{colorize('进度:', Color.BRIGHT_YELLOW)} {colorize(f'{processed_count:,}', Color.BRIGHT_CYAN)} / {colorize(f'{total_combinations:,}', Color.BRIGHT_CYAN)} ({colorize('100.0%', Color.BRIGHT_GREEN)}) {colorize('✓ 完成', Color.BRIGHT_GREEN)}")
+        print()
     
     return best_design, best_metric
 
