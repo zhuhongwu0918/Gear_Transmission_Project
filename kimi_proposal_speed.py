@@ -55,7 +55,7 @@ WIDTH_FACTOR1_FIXED = 8       # 第一级齿宽系数
 WIDTH_FACTOR2_FIXED = 10      # 第二级齿宽系数 (低速级更宽)
 
 # 齿宽系数扫描范围 (当 OPTIMIZE_WIDTH_FACTOR = True 时使用)
-WIDTH_FACTOR1_MIN, WIDTH_FACTOR1_MAX = 10, 10   # 第一级齿宽系数范围
+WIDTH_FACTOR1_MIN, WIDTH_FACTOR1_MAX = 8, 8   # 第一级齿宽系数范围
 WIDTH_FACTOR2_MIN, WIDTH_FACTOR2_MAX = 10, 10   # 第二级齿宽系数范围
 WIDTH_FACTOR_STEP = 1                           # 齿宽系数步长
 
