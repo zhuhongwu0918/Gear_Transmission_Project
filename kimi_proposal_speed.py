@@ -5,36 +5,95 @@
 方法：参数化扫描优化
 更新：速度约束改为固定输出转速，反推电机转速需求
 """
-
 import math
+import os
+import sys
+import signal
+import gc
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple, List, Dict
 
-# ==================== 设定参数 (根据你的需求调节) ====================
+# 设置多进程启动方法为 'spawn'，避免 fork 导致的资源继承问题
+# 这必须在导入 multiprocessing 之前设置
+import multiprocessing as mp
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # 如果已经设置则忽略
 
-# 电机参考参数
-motor_D = 75              # 电机直径 (mm)，作为模组包络参考
-output_speed = 260        # 输出转速要求：固定为 rpm
-output_torque = 7         # 输出扭矩要求：大于 Nm
-motor_torque_lower = 0.7  # 电机额定扭矩下限 Nm，按照下限计算
-motor_torque_upper = 1.2  # 电机额定扭矩上限 Nm
-motor_weight = 300        # 电机重量，克
+# ==================== 可调参数配置区 ====================
+# 所有可调参数集中在此区域，方便调试
 
+# ---- 1. 性能约束参数 ----
+MOTOR_TORQUE_LOWER = 0.8     # 电机额定扭矩下限 (Nm)，用于计算最小传动比
+OUTPUT_TORQUE = 4            # 输出扭矩要求 (Nm)，目标输出扭矩
+MAX_MOTOR_SPEED = 4000       # 电机最大允许转速 (rpm)，限制最大传动比
+OUTPUT_SPEED = 250           # 输出转速要求 (rpm)，固定输出转速
 
+# ---- 2. 结构约束参数 ----
+MOTOR_D = 75                 # 电机直径 (mm)，用于包络约束（从动轮直径不能超过此值）
+MIN_CLEARANCE = 1            # D1与D3之间最小间隙 (mm)，避免一级/二级主动轮干涉
+MIN_TEETH = 17               # 最小齿数 (避免根切，标准齿轮通常≥17)
 
-# 优化模式选择
-# 'weight'  = 重量最轻优化（默认）
-# 'size'    = 纵向尺寸最短优化（总尺寸 = motor_D/2 + D1/2 + D2/2 + D3/2 + D4）
-OPTIMIZATION_MODE = 'weight'  # 可选: 'weight' 或 'size'
+# ---- 3. 齿轮直径扫描范围 (mm) ----
+D1_MIN, D1_MAX = 15, 30      # 主动轮1直径范围 (一级主动轮，连接电机)
+D2_MIN, D2_MAX = 50, 120     # 从动轮2直径范围 (一级从动轮，减速输出)
+D3_MIN, D3_MAX = 10, 40      # 主动轮3直径范围 (二级主动轮，与D2同轴)
+D4_MIN, D4_MAX = 30, 80      # 从动轮4直径范围 (二级从动轮，最终输出)
+STEP = 1                     # 直径扫描步长 (mm)，1=精细扫描，5=快速预览
 
+# ---- 4. 模数选项 ----
+M1_OPTIONS = [0.3, 0.4, 0.5, 0.8, 1.0, 1.25, 1.5]   # 第一级模数选项 (高速级选小模数)
+M2_OPTIONS = [0.5, 0.8, 1.0, 1.25, 1.5, 2.0, 2.5]   # 第二级模数选项 (低速级选大模数)
 
-# 速度约束
-max_motor_speed = 3000    # 电机最大允许转速 rpm
-# 电机类型	KV 值 (RPM/V)	24V 理论空载转速	实际安全上限
-# 高扭矩型（机器人关节）	80~150	1900~3600 RPM	1500~2500 RPM
-# 通用型（云台/航模）	150~250	3600~6000 RPM	2500~4000 RPM
-# 高转速型	250~400	6000~9600 RPM	4000~7000 RPM
+# ---- 5. 齿宽(轴向厚度)系数设置 ----
+# 齿宽 = 系数 × 模数，经验值：6-12
+OPTIMIZE_WIDTH_FACTOR = True  # True=扫描优化齿宽系数, False=使用固定值
 
+# 固定齿宽系数 (当 OPTIMIZE_WIDTH_FACTOR = False 时使用)
+WIDTH_FACTOR1_FIXED = 8       # 第一级齿宽系数
+WIDTH_FACTOR2_FIXED = 10      # 第二级齿宽系数 (低速级更宽)
+
+# 齿宽系数扫描范围 (当 OPTIMIZE_WIDTH_FACTOR = True 时使用)
+WIDTH_FACTOR1_MIN, WIDTH_FACTOR1_MAX = 10, 10   # 第一级齿宽系数范围
+WIDTH_FACTOR2_MIN, WIDTH_FACTOR2_MAX = 10, 10   # 第二级齿宽系数范围
+WIDTH_FACTOR_STEP = 1                           # 齿宽系数步长
+
+# ---- 6. 优化模式选择 ----
+# 'weight' = 重量最轻优化（默认）
+# 'size'   = 纵向尺寸最短优化（总尺寸 = MOTOR_D/2 + D1/2 + D2/2 + D3/2 + D4）
+OPTIMIZATION_MODE = 'size'
+
+# ---- 7. 其他参数 ----
+MOTOR_WEIGHT = 300           # 电机重量 (g)
+GEAR_PRESSURE_ANGLE = 20     # 压力角 (度)
+
+# ==================== 参数映射 (兼容旧代码变量名) ====================
+# 以下代码将新参数名映射到旧变量名，保持代码其余部分不变
+motor_D = MOTOR_D
+output_speed = OUTPUT_SPEED
+output_torque = OUTPUT_TORQUE
+motor_torque_lower = MOTOR_TORQUE_LOWER
+motor_torque_upper = 1.2     # 保留但不常用
+motor_weight = MOTOR_WEIGHT
+max_motor_speed = MAX_MOTOR_SPEED
+
+m1_options = M1_OPTIONS
+m2_options = M2_OPTIONS
+
+D1_min, D1_max = D1_MIN, D1_MAX
+D2_min, D2_max = D2_MIN, D2_MAX
+D3_min, D3_max = D3_MIN, D3_MAX
+D4_min, D4_max = D4_MIN, D4_MAX
+step = STEP
+
+width_factor1_fixed = WIDTH_FACTOR1_FIXED
+width_factor2_fixed = WIDTH_FACTOR2_FIXED
+width_factor1_min, width_factor1_max = WIDTH_FACTOR1_MIN, WIDTH_FACTOR1_MAX
+width_factor2_min, width_factor2_max = WIDTH_FACTOR2_MIN, WIDTH_FACTOR2_MAX
+width_factor_step = WIDTH_FACTOR_STEP
+
+gear_pressure_angle = GEAR_PRESSURE_ANGLE
 
 # ==================== 材料选择与强度约束 ====================
 
@@ -89,39 +148,7 @@ MATERIAL_DB = {
 # 材料参数 (当前选定材质, auto模式下会被覆盖)
 rho_steel = 7.85e-6       # 钢材密度 (kg/mm^3)
 
-# ==================== 优化参数设置 ====================
 
-# 模数选择范围 (标准模数)，一级用 0.5 或 0.8，二级用 1.0 或 1.25
-# 可选模数，第一系列（首选）： 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0
-
-m1_options = [0.3, 0.4, 0.5, 0.8, 1.0, 1.25, 1.5]      # 第一级模数选项 (高速级选小模数)
-m2_options = [0.5, 0.8, 1.0, 1.25, 1.5, 2.0, 2.5]      # 第二级模数选项 (低速级选大模数)
-
-# 直径扫描范围 (以直径为核心变量)
-D1_min, D1_max = 20, 40     # 主动轮1直径范围 (mm)
-D2_min, D2_max = 50, 100    # 从动轮2直径范围 (mm)
-D3_min, D3_max = 18, 40     # 主动轮3直径范围 (mm)
-D4_min, D4_max = 40, 80     # 从动轮4直径范围 (mm)
-
-# ==================== 齿宽(轴向厚度)系数设置 ====================
-# 齿宽 = 系数 × 模数，经验值：6-12
-# 齿轮轴向厚度 = 齿宽系数 × 模数
-
-# 是否优化齿宽系数
-OPTIMIZE_WIDTH_FACTOR = True  # True = 扫描优化齿宽系数, False = 使用固定值
-
-# 固定齿宽系数 (当 OPTIMIZE_WIDTH_FACTOR = False 时使用)
-width_factor1_fixed = 8   # 第一级齿宽系数
-width_factor2_fixed = 10  # 第二级齿宽系数 (低速级更宽)
-
-# 齿宽系数扫描范围 (当 OPTIMIZE_WIDTH_FACTOR = True 时使用)
-width_factor1_min, width_factor1_max = 10, 15   # 第一级齿宽系数范围
-width_factor2_min, width_factor2_max = 10, 10   # 第二级齿宽系数范围 (低速级更宽)
-width_factor_step = 1                          # 齿宽系数步长 (整数)
-# 压力角
-gear_pressure_angle = 20  # 压力角 20度
-# 步长设置
-step = 1  # 直径扫描步长 (mm)
 
 
 # ==================== 颜色定义 ====================
@@ -312,12 +339,168 @@ class DesignResult:
     material_check_results: dict = None
 
 
-# ==================== 优化计算 ====================
-def optimize_gear_design():
-    """齿轮优化设计主函数"""
+# ==================== 并行搜索任务 ====================
+# 使用进程池时需要在模块级别定义，避免序列化问题
+def evaluate_single_design(params: Tuple) -> Optional[Dict]:
+    """
+    评估单个设计组合
+    返回字典而非对象，减少序列化开销
+    """
+    (m1, m2, width_factor1, width_factor2, D1, D2, D3, D4,
+     local_material_mode, local_material_db, local_opt_mode, local_output_speed,
+     local_max_motor_speed, local_motor_torque, local_output_torque, local_motor_D, local_motor_weight) = params
     
-    best_metric = float('inf')  # 根据优化模式，可以是重量或尺寸
-    best_design: Optional[DesignResult] = None
+    # ----- 1. 计算并修正齿数 (齿数必须为整数) -----
+    z1 = round(D1 / m1)
+    z2 = round(D2 / m1)
+    z3 = round(D3 / m2)
+    z4 = round(D4 / m2)
+    
+    # 齿数约束：避免根切，最少齿数通常为17(标准齿轮)
+    if z1 < 17 or z2 < 17 or z3 < 17 or z4 < 17:
+        return None
+    
+    # ----- 2. 更新实际分度圆直径 -----
+    D1_real = z1 * m1
+    D2_real = z2 * m1
+    D3_real = z3 * m2
+    D4_real = z4 * m2
+    
+    # ----- 3. 计算传动比 -----
+    i1 = z2 / z1
+    i2 = z4 / z3
+    Total_Ratio = i1 * i2
+    
+    # ----- 4. 计算轴距参数 -----
+    wheelbase1 = (D1_real + D2_real) / 2
+    wheelbase2 = (D3_real + D4_real) / 2
+    
+    if wheelbase1 <= 0 or wheelbase2 <= 0:
+        return None
+    
+    # ----- 5. 计算齿宽 -----
+    width1 = width_factor1 * m1
+    width2 = width_factor2 * m2
+    
+    # ----- 6. 性能计算 -----
+    actual_output_speed = local_output_speed
+    desired_motor_speed = actual_output_speed * Total_Ratio
+    
+    if desired_motor_speed > local_max_motor_speed:
+        return None
+    
+    motor_torque = local_motor_torque
+    actual_output_torque = motor_torque * Total_Ratio * 0.95 * 0.95
+    
+    # ----- 7. 约束检查 -----
+    if actual_output_torque < local_output_torque:
+        return None
+    
+    if max(D2_real, D4_real) > local_motor_D:
+        return None
+    
+    if (D1_real - D3_real) < 1:
+        return None
+    
+    # ----- 8. 重量计算 -----
+    if local_material_mode == 'auto':
+        temp_density = local_material_db['steel']['density']
+    else:
+        temp_density = local_material_db[local_material_mode]['density']
+    
+    vol1 = math.pi * (D1_real / 2) ** 2 * width1
+    vol2 = math.pi * (D2_real / 2) ** 2 * width1
+    vol3 = math.pi * (D3_real / 2) ** 2 * width2
+    vol4 = math.pi * (D4_real / 2) ** 2 * width2
+    
+    Total_Weight_kg = 0.5 * (vol1 + vol2 + vol3 + vol4) * temp_density
+    
+    # ----- 9. 纵向尺寸计算 -----
+    total_size = local_motor_D / 2 + D1_real / 2 + D2_real / 2 + D3_real / 2 + D4_real
+    
+    # ----- 10. 材料强度校核 -----
+    # 注意: select_material_by_strength 函数内部会将扭矩从 N·m 转为 N·mm
+    # 所以这里传入的是 N·m (motor_torque 已经是 N·m)
+    T1_motor = motor_torque  # N·m
+    T2_intermediate = T1_motor * i1 * 0.95  # N·m (第一级输出 = 第二级输入)
+    
+    if local_material_mode == 'auto':
+        selected_mat, mat_check_results = select_material_by_strength(
+            m1, m2, z1, z2, z3, z4, width1, width2,
+            T1_motor, T2_intermediate, local_material_db
+        )
+    else:
+        selected_mat = local_material_mode
+        _, mat_check_results = select_material_by_strength(
+            m1, m2, z1, z2, z3, z4, width1, width2,
+            T1_motor, T2_intermediate, {local_material_mode: local_material_db[local_material_mode]}
+        )
+    
+    if selected_mat not in mat_check_results:
+        return None
+        
+    mat_result = mat_check_results[selected_mat]
+    strength_pass = mat_result['suitable']
+    
+    if not strength_pass and local_material_mode == 'auto':
+        for key, result in mat_check_results.items():
+            if result['suitable']:
+                selected_mat = key
+                mat_result = result
+                strength_pass = True
+                break
+    
+    if not strength_pass:
+        return None
+    
+    # 计算最终指标
+    if local_opt_mode == 'weight':
+        current_metric = Total_Weight_kg
+    else:
+        current_metric = total_size
+    
+    mat_props = local_material_db[selected_mat]
+    actual_density = mat_props['density']
+    Total_Weight_kg_actual = 0.5 * (vol1 + vol2 + vol3 + vol4) * actual_density
+    Total_Weight_g_actual = Total_Weight_kg_actual * 1000
+    Total_System_Weight_actual = Total_Weight_g_actual + local_motor_weight
+    
+    return {
+        'm1': m1, 'm2': m2, 'z1': z1, 'z2': z2, 'z3': z3, 'z4': z4,
+        'D1': D1_real, 'D2': D2_real, 'D3': D3_real, 'D4': D4_real,
+        'width1': width1, 'width2': width2,
+        'wheelbase1': wheelbase1, 'wheelbase2': wheelbase2,
+        'i1': i1, 'i2': i2, 'Total_Ratio': Total_Ratio,
+        'output_speed': actual_output_speed,
+        'desired_motor_speed': desired_motor_speed,
+        'output_torque': actual_output_torque,
+        'gear_weight_g': Total_Weight_g_actual,
+        'total_weight_g': Total_System_Weight_actual,
+        'total_size': total_size,
+        'material_key': selected_mat,
+        'material_name': mat_props['name'],
+        'material_density': mat_props['density'],
+        'max_bending_stress': mat_result.get('max_stress', 0),
+        'allow_bending_stress': mat_result.get('allow_stress', 0),
+        'strength_check_pass': mat_result.get('suitable', False),
+        'metric': current_metric,
+        'selected_material_result': {
+            'name': mat_props['name'],
+            'max_stress': mat_result.get('max_stress', 0),
+            'allow_stress': mat_result.get('allow_stress', 0),
+            'suitable': mat_result.get('suitable', False),
+            'safety_margin': mat_result.get('safety_margin', 0),
+            'density': mat_props['density']
+        }
+    }
+
+
+def optimize_gear_design():
+    """齿轮优化设计主函数 - 细粒度任务切分版本 (防卡死优化)"""
+    import time
+    
+    # 强制垃圾回收，清理之前运行的残留
+    gc.collect()
     
     # 优化模式显示
     mode_display = "重量最轻" if OPTIMIZATION_MODE == 'weight' else "纵向尺寸最短"
@@ -325,237 +508,164 @@ def optimize_gear_design():
     
     print(colorize('╔══════════════════════════════════════════════════════════╗', Color.BRIGHT_CYAN))
     print(colorize('║                  开始齿轮优化计算...                     ║', Color.BRIGHT_CYAN + Color.BOLD))
+    print(colorize('║      (细粒度任务切分版 - 防止系统卡死)                   ║', Color.BRIGHT_CYAN))
     print(colorize('╚══════════════════════════════════════════════════════════╝', Color.BRIGHT_CYAN))
     print(f"{colorize('优化模式:', Color.BRIGHT_YELLOW)} {colorize(mode_display, mode_color + Color.BOLD)}")
     print(f"{colorize('扫描范围:', Color.BRIGHT_YELLOW)} D1[{D1_min}-{D1_max}], D2[{D2_min}-{D2_max}], D3[{D3_min}-{D3_max}], D4[{D4_min}-{D4_max}]")
     if OPTIMIZE_WIDTH_FACTOR:
-        print(f"{colorize('齿宽系数范围:', Color.BRIGHT_YELLOW)} 第一级[{width_factor1_min}-{width_factor1_max}], 第二级[{width_factor2_min}-{width_factor2_max}] (优化轴向厚度)")
+        print(f"{colorize('齿宽系数范围:', Color.BRIGHT_YELLOW)} 第一级[{width_factor1_min}-{width_factor1_max}], 第二级[{width_factor2_min}-{width_factor2_max}]")
     else:
-        print(f"{colorize('齿宽系数:', Color.BRIGHT_YELLOW)} 第一级={width_factor1_fixed}, 第二级={width_factor2_fixed} (固定轴向厚度)")
-    print(f"{colorize('约束条件:', Color.BRIGHT_YELLOW)} 输出转速={colorize(str(output_speed), Color.BRIGHT_GREEN)} rpm (固定), 输出扭矩>={colorize(str(output_torque), Color.BRIGHT_GREEN)} Nm, 电机转速<={colorize(str(max_motor_speed), Color.BRIGHT_GREEN)} rpm\n")
+        print(f"{colorize('齿宽系数:', Color.BRIGHT_YELLOW)} 第一级={width_factor1_fixed}, 第二级={width_factor2_fixed}")
+    print(f"{colorize('约束条件:', Color.BRIGHT_YELLOW)} 输出转速={colorize(str(output_speed), Color.BRIGHT_GREEN)} rpm, 输出扭矩>={colorize(str(output_torque), Color.BRIGHT_GREEN)} Nm\n")
     
     # 齿宽系数选项
     if OPTIMIZE_WIDTH_FACTOR:
-        width_factor1_options = range(width_factor1_min, width_factor1_max + 1, width_factor_step)
-        width_factor2_options = range(width_factor2_min, width_factor2_max + 1, width_factor_step)
+        width_factor1_options = list(range(width_factor1_min, width_factor1_max + 1, width_factor_step))
+        width_factor2_options = list(range(width_factor2_min, width_factor2_max + 1, width_factor_step))
     else:
         width_factor1_options = [width_factor1_fixed]
         width_factor2_options = [width_factor2_fixed]
     
-    # 计算总搜索空间
-    total_combinations = (len(m1_options) * len(m2_options) * 
-                         len(width_factor1_options) * len(width_factor2_options) *
-                         ((D1_max - D1_min) // step + 1) * 
-                         ((D2_max - D2_min) // step + 1) *
-                         ((D3_max - D3_min) // step + 1) * 
-                         ((D4_max - D4_min) // step + 1))
-    print(f"{colorize('搜索空间:', Color.BRIGHT_YELLOW)} 约 {colorize(f'{total_combinations:,}', Color.BRIGHT_CYAN)} 种组合")
-    print(f"{colorize('进度显示:', Color.BRIGHT_YELLOW)} 每处理1000万组刷新一次...")
-    print()
+    # 预先生成所有单个评估任务参数（细粒度切分）
+    D1_list = list(range(D1_min, D1_max + 1, step))
+    D2_list = list(range(D2_min, D2_max + 1, step))
+    D3_list = list(range(D3_min, D3_max + 1, step))
+    D4_list = list(range(D4_min, D4_max + 1, step))
     
-    processed_count = 0
-    last_progress_print = 0
-    
-    # 嵌套循环优化搜索
+    # 构建单个评估任务列表 - 每个任务只评估一个D1,D2,D3,D4组合
+    tasks = []
     for m1 in m1_options:
         for m2 in m2_options:
-            for width_factor1 in width_factor1_options:
-                for width_factor2 in width_factor2_options:
-                    for D1 in range(D1_min, D1_max + 1, step):
-                        for D2 in range(D2_min, D2_max + 1, step):
-                            for D3 in range(D3_min, D3_max + 1, step):
-                                    for D4 in range(D4_min, D4_max + 1, step):
-                                        # 进度计数
-                                        processed_count += 1
-                                        if processed_count - last_progress_print >= 10_000_000:  # 每1000万组显示一次
-                                            print(f"\r{colorize('进度:', Color.BRIGHT_YELLOW)} {colorize(f'{processed_count:,}', Color.BRIGHT_CYAN)} / {colorize(f'{total_combinations:,}', Color.BRIGHT_CYAN)} ({colorize(f'{processed_count/total_combinations*100:.1f}%', Color.BRIGHT_GREEN)})", end='', flush=True)
-                                            last_progress_print = processed_count
-                                        
-                                        # ----- 1. 计算并修正齿数 (齿数必须为整数) -----
-                                        z1 = round(D1 / m1)
-                                        z2 = round(D2 / m1)
-                                        z3 = round(D3 / m2)
-                                        z4 = round(D4 / m2)
-                                        
-                                        # 齿数约束：避免根切，最少齿数通常为17(标准齿轮)
-                                        if z1 < 17 or z2 < 17 or z3 < 17 or z4 < 17:
-                                            continue
-                                        
-                                        # ----- 2. 更新实际分度圆直径 -----
-                                        D1_real = z1 * m1
-                                        D2_real = z2 * m1
-                                        D3_real = z3 * m2
-                                        D4_real = z4 * m2
-                                        
-                                        # ----- 3. 计算传动比 -----
-                                        i1 = z2 / z1
-                                        i2 = z4 / z3
-                                        Total_Ratio = i1 * i2
-                                        
-                                        # ----- 4. 计算轴距参数 -----
-                                        wheelbase1 = (D1_real + D2_real) / 2  # 第一级中心距
-                                        wheelbase2 = (D3_real + D4_real) / 2  # 第二级中心距
-                                        
-                                        # 轴距约束：确保物理上可装配
-                                        if wheelbase1 <= 0 or wheelbase2 <= 0:
-                                            continue
-                                        
-                                        # ----- 5. 计算齿宽(轴向厚度) -----
-                                        width1 = width_factor1 * m1  # 第一级齿轮轴向厚度
-                                        width2 = width_factor2 * m2  # 第二级齿轮轴向厚度
-                                        
-                                        # ----- 6. 性能计算 -----
-                                        
-                                        # 固定输出转速，反推所需电机转速
-                                        actual_output_speed = output_speed  # 固定输出转速
-                                        desired_motor_speed = actual_output_speed * Total_Ratio  # rpm
-                                        
-                                        # 电机转速约束：不能超过最大允许转速
-                                        if desired_motor_speed > max_motor_speed:
-                                            continue
-                                        
-                                        # 扭矩计算 (假设电机额定扭矩取下限值)
-                                        motor_torque = motor_torque_lower
-                                        actual_output_torque = motor_torque * Total_Ratio * 0.95 * 0.95  # 考虑两级传动效率各95%
-                                        
-                                        # ----- 7. 约束检查 -----
-                                        # 输出扭矩约束
-                                        if actual_output_torque < output_torque:
-                                            continue
-                                        
-                                        # 包络尺寸约束：从动轮直径不超过电机直径的1倍
-                                        if max(D2_real, D4_real) > motor_D:
-                                            continue
-                                        
-                                        # 约束：一级主动轮(D1)要大于二级主动轮(D3)至少1mm间隙
-                                        # 避免干涉，确保二级主动轮可以安装在中间轴上不与一级主动轮冲突
-                                        if (D1_real - D3_real) < 1:  # 当间隙小于1mm时跳过
-                                            continue
-
-                                        
-                                        # ----- 8. 重量计算 (简化为圆柱体模型) -----
-                                        # 在auto模式下，先使用钢的密度估算，后续会更新为实际材质密度
-                                        if MATERIAL_MODE == 'auto':
-                                            temp_density = MATERIAL_DB['steel']['density']
-                                        else:
-                                            temp_density = MATERIAL_DB[MATERIAL_MODE]['density']
-                                        
-                                        # 齿轮体积计算 (分度圆直径 × 齿宽近似)
-                                        vol1 = math.pi * (D1_real / 2) ** 2 * width1
-                                        vol2 = math.pi * (D2_real / 2) ** 2 * width1
-                                        vol3 = math.pi * (D3_real / 2) ** 2 * width2
-                                        vol4 = math.pi * (D4_real / 2) ** 2 * width2
-                                        
-                                        # 修正：四个齿轮体积之和 × 密度，表示挖空体积占一半
-                                        Total_Weight_kg = 0.5 * (vol1 + vol2 + vol3 + vol4) * temp_density
-                                        Total_Weight_g = Total_Weight_kg * 1000
-                                        
-                                        # 总重量包含电机
-                                        Total_System_Weight = Total_Weight_g + motor_weight
-                                        
-                                        # ----- 9. 纵向尺寸计算 -----
-                                        # 总尺寸 = 电机半径 + 一级主动轮半径 + 一级从动轮半径 + 二级主动轮半径 + 二级从动轮半径
-                                        # 简化：电机半径 + D1/2 + D2/2 + D3/2 + D4/2
-                                        total_size = motor_D / 2 + D1_real / 2 + D2_real / 2 + D3_real / 2 + D4_real / 2
-                                        
-                                        # ----- 10. 材料强度校核 -----
-                                        # 计算各级扭矩 (N·mm)
-                                        T1 = motor_torque * 1000  # 第一级输入扭矩
-                                        T2 = T1 * i1 * 0.95       # 第二级输入扭矩 (考虑一级效率)
-                                        
-                                        # 选择材质
-                                        if MATERIAL_MODE == 'auto':
-                                            selected_mat, mat_check_results = select_material_by_strength(
-                                                m1, m2, z1, z2, z3, z4, width1, width2,
-                                                T1, T2, MATERIAL_DB
-                                            )
-                                        else:
-                                            selected_mat = MATERIAL_MODE
-                                            # 仅校核指定材质
-                                            _, mat_check_results = select_material_by_strength(
-                                                m1, m2, z1, z2, z3, z4, width1, width2,
-                                                T1, T2, {MATERIAL_MODE: MATERIAL_DB[MATERIAL_MODE]}
-                                            )
-                                        
-                                        # 检查选定材质是否满足要求
-                                        if selected_mat in mat_check_results:
-                                            mat_result = mat_check_results[selected_mat]
-                                            strength_pass = mat_result['suitable']
-                                            
-                                            # 如果不满足强度要求且是auto模式,尝试选择其他材质
-                                            if not strength_pass and MATERIAL_MODE == 'auto':
-                                                # 查找第一个满足要求的材质
-                                                for key, result in mat_check_results.items():
-                                                    if result['suitable']:
-                                                        selected_mat = key
-                                                        mat_result = result
-                                                        strength_pass = True
-                                                        break
-                                            
-                                            # 强度约束检查 (非auto模式下如果不满足则跳过)
-                                            if not strength_pass and MATERIAL_MODE != 'auto':
-                                                continue
-                                        
-                                        # ----- 11. 记录最优解 -----
-                                        # 根据优化模式选择判断条件
-                                        if OPTIMIZATION_MODE == 'weight':
-                                            # 重量优化模式：选择重量最轻的
-                                            current_metric = Total_Weight_kg
-                                        else:
-                                            # 尺寸优化模式：选择尺寸最小的
-                                            current_metric = total_size
-                                        
-                                        if current_metric < best_metric:
-                                            best_metric = current_metric
-                                            
-                                            # 获取选定材质的详细信息
-                                            mat_props = MATERIAL_DB[selected_mat]
-                                            
-                                            # 使用实际材质密度重新计算重量
-                                            actual_density = mat_props['density']
-                                            Total_Weight_kg_actual = 0.5 * (vol1 + vol2 + vol3 + vol4) * actual_density
-                                            Total_Weight_g_actual = Total_Weight_kg_actual * 1000
-                                            Total_System_Weight_actual = Total_Weight_g_actual + motor_weight
-                                            
-                                            best_design = DesignResult(
-                                                m1=m1,
-                                                m2=m2,
-                                                z1=z1,
-                                                z2=z2,
-                                                z3=z3,
-                                                z4=z4,
-                                                D1=D1_real,
-                                                D2=D2_real,
-                                                D3=D3_real,
-                                                D4=D4_real,
-                                                width1=width1,
-                                                width2=width2,
-                                                wheelbase1=wheelbase1,
-                                                wheelbase2=wheelbase2,
-                                                i1=i1,
-                                                i2=i2,
-                                                Total_Ratio=Total_Ratio,
-                                                output_speed=actual_output_speed,
-                                                desired_motor_speed=desired_motor_speed,
-                                                output_torque=actual_output_torque,
-                                                gear_weight_g=Total_Weight_g_actual,
-                                                total_weight_g=Total_System_Weight_actual,
-                                                total_size=total_size,
-                                                material_key=selected_mat,
-                                                material_name=mat_props['name'],
-                                                material_density=mat_props['density'],
-                                                max_bending_stress=mat_result.get('max_stress', 0),
-                                                allow_bending_stress=mat_result.get('allow_stress', 0),
-                                                strength_check_pass=mat_result.get('suitable', False),
-                                                material_check_results=mat_check_results
-                                            )
+            for wf1 in width_factor1_options:
+                for wf2 in width_factor2_options:
+                    for D1 in D1_list:
+                        for D2 in D2_list:
+                            for D3 in D3_list:
+                                for D4 in D4_list:
+                                    tasks.append((
+                                        m1, m2, wf1, wf2, D1, D2, D3, D4,
+                                        MATERIAL_MODE, MATERIAL_DB, OPTIMIZATION_MODE, output_speed,
+                                        max_motor_speed, motor_torque_lower, output_torque, motor_D, motor_weight
+                                    ))
     
-    # 搜索完成，打印最终进度
-    if processed_count > 0:
-        print(f"\r{colorize('进度:', Color.BRIGHT_YELLOW)} {colorize(f'{processed_count:,}', Color.BRIGHT_CYAN)} / {colorize(f'{total_combinations:,}', Color.BRIGHT_CYAN)} ({colorize('100.0%', Color.BRIGHT_GREEN)}) {colorize('✓ 完成', Color.BRIGHT_GREEN)}")
-        print()
+    total_tasks = len(tasks)
+    cpu_count = mp.cpu_count()
     
-    return best_design, best_metric
+    print(f"{colorize('CPU核心数:', Color.BRIGHT_YELLOW)} {colorize(str(cpu_count), Color.BRIGHT_GREEN)}")
+    print(f"{colorize('搜索空间:', Color.BRIGHT_YELLOW)} 约 {colorize(f'{total_tasks:,}', Color.BRIGHT_CYAN)} 种组合")
+    print(f"{colorize('任务切分:', Color.BRIGHT_YELLOW)} {colorize('细粒度', Color.BRIGHT_CYAN)} (每个任务评估1种组合)")
+    print(f"{colorize('正在计算:', Color.BRIGHT_YELLOW)} 使用多进程并行搜索...")
+    print()
+    
+    # 严格限制并行度 - 使用单进程或少量进程，避免系统卡死
+    # 关键修复：对于细粒度任务，使用更多进程但每个任务极轻量
+    cpu_cores = min(cpu_count, 4)  # 最多4个进程
+    chunksize = max(1, len(tasks) // (cpu_cores * 100))  # 动态计算chunksize
+    
+    best_metric = float('inf')
+    best_result_dict = None
+    completed_tasks = 0
+    pool = None
+    
+    try:
+        # 使用上下文管理器确保池被正确关闭
+        pool = mp.Pool(processes=cpu_cores, maxtasksperchild=1000)
+        
+        # 使用 imap_unordered 实时获取结果
+        iterator = pool.imap_unordered(evaluate_single_design, tasks, chunksize=chunksize)
+        
+        last_update_time = time.time()
+        for result in iterator:
+            completed_tasks += 1
+            
+            # 每500ms或每1000个任务更新一次进度
+            current_time = time.time()
+            if (completed_tasks % 1000 == 0 or completed_tasks == total_tasks or 
+                (current_time - last_update_time) > 0.5):
+                progress = completed_tasks / total_tasks * 100
+                print(f"\r{colorize('进度:', Color.BRIGHT_YELLOW)} {colorize(f'{completed_tasks}/{total_tasks}', Color.BRIGHT_CYAN)} ({colorize(f'{progress:.1f}%', Color.BRIGHT_GREEN)})", end='', flush=True)
+                last_update_time = current_time
+            
+            # 更新最优解
+            if result is not None:
+                current_metric = result['metric']
+                if current_metric < best_metric:
+                    best_metric = current_metric
+                    best_result_dict = result
+        
+        # 正常关闭池
+        pool.close()
+        pool.join()
+        pool = None
+                    
+    except KeyboardInterrupt:
+        print(f"\n{colorize('用户中断计算', Color.BRIGHT_YELLOW)}")
+        if pool:
+            pool.terminate()
+            pool.join()
+        raise
+    except Exception as e:
+        print(f"\n{colorize(f'错误: {e}', Color.BRIGHT_RED)}")
+        if pool:
+            pool.terminate()
+            pool.join()
+        raise
+    finally:
+        # 确保池被清理
+        if pool:
+            try:
+                pool.terminate()
+                pool.join(timeout=1)
+            except:
+                pass
+        # 强制垃圾回收
+        gc.collect()
+    
+    print(f"\n{colorize('✓ 计算完成', Color.BRIGHT_GREEN)}")
+    print()
+    
+    # 将字典转换为 DesignResult 对象
+    if best_result_dict is not None:
+        # 构建 material_check_results (只包含选定材质)
+        material_check_results = {
+            best_result_dict['material_key']: best_result_dict['selected_material_result']
+        }
+        
+        best_design = DesignResult(
+            m1=best_result_dict['m1'],
+            m2=best_result_dict['m2'],
+            z1=best_result_dict['z1'],
+            z2=best_result_dict['z2'],
+            z3=best_result_dict['z3'],
+            z4=best_result_dict['z4'],
+            D1=best_result_dict['D1'],
+            D2=best_result_dict['D2'],
+            D3=best_result_dict['D3'],
+            D4=best_result_dict['D4'],
+            width1=best_result_dict['width1'],
+            width2=best_result_dict['width2'],
+            wheelbase1=best_result_dict['wheelbase1'],
+            wheelbase2=best_result_dict['wheelbase2'],
+            i1=best_result_dict['i1'],
+            i2=best_result_dict['i2'],
+            Total_Ratio=best_result_dict['Total_Ratio'],
+            output_speed=best_result_dict['output_speed'],
+            desired_motor_speed=best_result_dict['desired_motor_speed'],
+            output_torque=best_result_dict['output_torque'],
+            gear_weight_g=best_result_dict['gear_weight_g'],
+            total_weight_g=best_result_dict['total_weight_g'],
+            total_size=best_result_dict['total_size'],
+            material_key=best_result_dict['material_key'],
+            material_name=best_result_dict['material_name'],
+            material_density=best_result_dict['material_density'],
+            max_bending_stress=best_result_dict['max_bending_stress'],
+            allow_bending_stress=best_result_dict['allow_bending_stress'],
+            strength_check_pass=best_result_dict['strength_check_pass'],
+            material_check_results=material_check_results
+        )
+        return best_design, best_metric
+    else:
+        return None, float('inf')
 
 
 # ==================== 输出结果 ====================
@@ -586,13 +696,14 @@ def print_results(best_design: Optional[DesignResult], best_metric: float):
         mat_color = Color.BRIGHT_GREEN if best_design.strength_check_pass else Color.BRIGHT_RED
         print(f"{colorize('▶', Color.BRIGHT_GREEN)} {colorize('【选定材质】', Color.BRIGHT_YELLOW)}{colorize(best_design.material_name, mat_color + Color.BOLD)} {colorize(f'(密度: {best_design.material_density:.2e} kg/mm³)', Color.BRIGHT_CYAN)}")
         
-        # 材质校核结果汇总
+        # 材质校核结果汇总 (只显示选定材质)
         if best_design.material_check_results:
             print(f"{colorize('▶', Color.BRIGHT_GREEN)} {colorize('【材质校核】', Color.BRIGHT_YELLOW)}")
-            for key, result in best_design.material_check_results.items():
-                status_color = Color.BRIGHT_GREEN if result['suitable'] else Color.BRIGHT_RED
-                status = colorize('✓ 适用', status_color) if result['suitable'] else colorize('✗ 不适用', status_color)
-                print(f"   {result['name']}: {status} (应力: {result['max_stress']:.1f}/{result['allow_stress']:.1f} MPa, 安全裕度: {result['safety_margin']:.2f})")
+            selected_result = best_design.material_check_results.get(best_design.material_key, {})
+            if selected_result:
+                status_color = Color.BRIGHT_GREEN if selected_result.get('suitable', False) else Color.BRIGHT_RED
+                status = colorize('✓ 适用', status_color) if selected_result.get('suitable', False) else colorize('✗ 不适用', status_color)
+                print(f"   {selected_result.get('name', best_design.material_name)}: {status} (应力: {selected_result.get('max_stress', 0):.1f}/{selected_result.get('allow_stress', 0):.1f} MPa, 安全裕度: {selected_result.get('safety_margin', 0):.2f})")
         print()
         print()
         
@@ -630,33 +741,60 @@ def print_results(best_design: Optional[DesignResult], best_metric: float):
             """渐开线函数 inv(α) = tan(α) - α (α为弧度)"""
             return math.tan(x) - x
         
-        def tooth_thickness_at_root(d, df, z, m, alpha_rad):
+        def tooth_thickness_at_root(d, df, m, alpha_rad, z):
             """计算齿根圆处齿厚
             d: 分度圆直径
-            df: 齿根圆直径  
-            z: 齿数
+            df: 齿根圆直径
             m: 模数
             alpha_rad: 压力角(弧度)
+            z: 齿数
             """
-            if df <= 0:
+            if df <= 0 or z <= 0:
                 return 0
-            # 分度圆齿厚 (标准齿轮)
+            
+            # 基圆直径
+            db = d * math.cos(alpha_rad)
+            
+            # 如果齿根圆小于基圆，渐开线不延伸到齿根圆
+            # 使用齿根圆处的弦齿厚近似估算
+            if df < db:
+                # 分度圆齿厚
+                s = math.pi * m / 2
+                # 齿根高
+                hf = 1.25 * m
+                # 使用简化公式估算齿根圆处齿厚
+                # 考虑齿廓从分度圆到齿根圆的收缩
+                # 经验公式：sf ≈ s * (df/d) - 2 * hf * tan(alpha_rad) * (收缩修正)
+                # 更准确的估算：使用30°切线法概念
+                # 假设齿根圆处齿厚与分度圆齿厚的比例约等于直径比减去齿槽收缩
+                ratio = df / d
+                # 齿槽在齿根圆处的宽度变化
+                slot_width_change = 2 * hf * math.tan(alpha_rad)
+                sf_estimate = s * ratio - slot_width_change * 0.5
+                return max(0.1 * m, sf_estimate)  # 至少保留0.1倍模数的齿厚
+            
+            # 标准渐开线齿厚计算
             s = math.pi * m / 2
-            # 齿根圆压力角
             cos_alpha_f = (d * math.cos(alpha_rad)) / df
             if cos_alpha_f >= 1 or cos_alpha_f <= -1:
-                return 0
+                return max(0.1 * m, s * df / d)  # 退回到简化估算
             alpha_f = math.acos(cos_alpha_f)
-            # 齿根圆齿厚
             s_f = df * (s / d + inv(alpha_rad) - inv(alpha_f))
-            return max(0, s_f)
-        
+            return max(0.1 * m, s_f)
+
         # 第一级齿根圆齿厚
-        sf_tooth_1 = tooth_thickness_at_root(best_design.D1, df1, best_design.z1, best_design.m1, alpha)
-        sf_tooth_2 = tooth_thickness_at_root(best_design.D2, df2, best_design.z2, best_design.m1, alpha)
+        sf_tooth_1 = tooth_thickness_at_root(best_design.D1, df1, best_design.m1, alpha, best_design.z1)
+        sf_tooth_2 = tooth_thickness_at_root(best_design.D2, df2, best_design.m1, alpha, best_design.z2)
         # 第二级齿根圆齿厚
-        sf_tooth_3 = tooth_thickness_at_root(best_design.D3, df3, best_design.z3, best_design.m2, alpha)
-        sf_tooth_4 = tooth_thickness_at_root(best_design.D4, df4, best_design.z4, best_design.m2, alpha)
+        sf_tooth_3 = tooth_thickness_at_root(best_design.D3, df3, best_design.m2, alpha, best_design.z3)
+        sf_tooth_4 = tooth_thickness_at_root(best_design.D4, df4, best_design.m2, alpha, best_design.z4)
+        
+        # 计算各级扭矩 (N·m)
+        T_motor = motor_torque_lower  # 电机输出扭矩
+        T1_input = T_motor  # 第一级主动轮输入扭矩
+        T1_output = T1_input * best_design.i1 * 0.95  # 第一级从动轮输出扭矩 (考虑效率)
+        T2_input = T1_output  # 第二级主动轮输入扭矩 = 第一级输出
+        T2_output = T2_input * best_design.i2 * 0.95  # 第二级从动轮输出扭矩 (考虑效率)
         
         # 齿轮参数
         print(colorize('┌────────────────── 齿轮参数 ──────────────────┐', Color.BRIGHT_BLUE))
@@ -667,8 +805,10 @@ def print_results(best_design: Optional[DesignResult], best_metric: float):
         print(f"│   危险截面齿根宽 sf1 = {colorize(f'{sf1:.3f}', Color.BRIGHT_YELLOW)} mm (sf/m = {colorize(f'{sf_m_ratio1:.3f}', Color.BRIGHT_YELLOW)})")
         print(f"│   主动轮: 齿数 z1 = {colorize(f'{best_design.z1}', Color.BRIGHT_CYAN)}, 分度圆直径 D1 = {colorize(f'{best_design.D1:.2f}', Color.BRIGHT_CYAN)} mm")
         print(f"│           齿根圆直径 = {colorize(f'{df1:.2f}', Color.BRIGHT_CYAN)} mm, 齿根圆处齿厚 = {colorize(f'{sf_tooth_1:.3f}', Color.BRIGHT_GREEN)} mm")
+        print(f"│           输入扭矩 = {colorize(f'{T1_input:.3f}', Color.BRIGHT_YELLOW)} N·m")
         print(f"│   从动轮: 齿数 z2 = {colorize(f'{best_design.z2}', Color.BRIGHT_CYAN)}, 分度圆直径 D2 = {colorize(f'{best_design.D2:.2f}', Color.BRIGHT_CYAN)} mm")
         print(f"│           齿根圆直径 = {colorize(f'{df2:.2f}', Color.BRIGHT_CYAN)} mm, 齿根圆处齿厚 = {colorize(f'{sf_tooth_2:.3f}', Color.BRIGHT_GREEN)} mm")
+        print(f"│           输出扭矩 = {colorize(f'{T1_output:.3f}', Color.BRIGHT_YELLOW)} N·m")
         print(f"│   传动比 i1 = {colorize(f'{best_design.i1:.3f}', Color.BRIGHT_GREEN)}")
         print(f"{colorize('│', Color.BRIGHT_BLUE)}")
         print(f"{colorize('│ 第二级 (低速级):', Color.BRIGHT_MAGENTA)}")
@@ -678,8 +818,10 @@ def print_results(best_design: Optional[DesignResult], best_metric: float):
         print(f"│   危险截面齿根宽 sf2 = {colorize(f'{sf2:.3f}', Color.BRIGHT_YELLOW)} mm (sf/m = {colorize(f'{sf_m_ratio2:.3f}', Color.BRIGHT_YELLOW)})")
         print(f"│   主动轮: 齿数 z3 = {colorize(f'{best_design.z3}', Color.BRIGHT_CYAN)}, 分度圆直径 D3 = {colorize(f'{best_design.D3:.2f}', Color.BRIGHT_CYAN)} mm")
         print(f"│           齿根圆直径 = {colorize(f'{df3:.2f}', Color.BRIGHT_CYAN)} mm, 齿根圆处齿厚 = {colorize(f'{sf_tooth_3:.3f}', Color.BRIGHT_GREEN)} mm")
+        print(f"│           输入扭矩 = {colorize(f'{T2_input:.3f}', Color.BRIGHT_YELLOW)} N·m")
         print(f"│   从动轮: 齿数 z4 = {colorize(f'{best_design.z4}', Color.BRIGHT_CYAN)}, 分度圆直径 D4 = {colorize(f'{best_design.D4:.2f}', Color.BRIGHT_CYAN)} mm")
         print(f"│           齿根圆直径 = {colorize(f'{df4:.2f}', Color.BRIGHT_CYAN)} mm, 齿根圆处齿厚 = {colorize(f'{sf_tooth_4:.3f}', Color.BRIGHT_GREEN)} mm")
+        print(f"│           输出扭矩 = {colorize(f'{T2_output:.3f}', Color.BRIGHT_YELLOW)} N·m")
         print(f"│   传动比 i2 = {colorize(f'{best_design.i2:.3f}', Color.BRIGHT_GREEN)}")
         print(colorize('└──────────────────────────────────────────────┘', Color.BRIGHT_BLUE))
         print()
@@ -742,15 +884,16 @@ def print_results(best_design: Optional[DesignResult], best_metric: float):
         stress_color = Color.BRIGHT_GREEN if stress_ratio < 1.0 else Color.BRIGHT_RED
         print(f"│ 应力比: {colorize(f'{stress_ratio:.2f}', Color.BRIGHT_CYAN)} {colorize(stress_status, stress_color)}")
         
-        # 各材质校核对比
+        # 各材质校核对比 (现在只显示选定材质)
         if best_design.material_check_results:
             print(f"{colorize('│', Color.BRIGHT_BLUE)}")
-            print(f"{colorize('│ 各材质校核对比:', Color.BRIGHT_MAGENTA)}")
-            for key, result in best_design.material_check_results.items():
-                marker = "►" if key == best_design.material_key else " "
-                status = colorize('✓', Color.BRIGHT_GREEN) if result['suitable'] else colorize('✗', Color.BRIGHT_RED)
-                weight_est = best_design.gear_weight_g * (result['density'] / best_design.material_density)
-                print(f"│ {marker} {status} {result['name']}: 应力 {result['max_stress']:.1f}/{result['allow_stress']:.1f} MPa, 预估重量 {weight_est:.1f}g")
+            print(f"{colorize('│ 材质校核详情:', Color.BRIGHT_MAGENTA)}")
+            # 获取选定材质的结果
+            selected_result = best_design.material_check_results.get(best_design.material_key, {})
+            if selected_result:
+                status = colorize('✓', Color.BRIGHT_GREEN) if selected_result.get('suitable', False) else colorize('✗', Color.BRIGHT_RED)
+                weight_est = best_design.gear_weight_g * (selected_result.get('density', best_design.material_density) / best_design.material_density)
+                print(f"│ ► {status} {selected_result.get('name', best_design.material_name)}: 应力 {selected_result.get('max_stress', 0):.1f}/{selected_result.get('allow_stress', 0):.1f} MPa, 安全裕度 {selected_result.get('safety_margin', 0):.2f}")
         print(colorize('└──────────────────────────────────────────────┘', Color.BRIGHT_BLUE))
         print()
         
@@ -786,6 +929,19 @@ def print_results(best_design: Optional[DesignResult], best_metric: float):
 
 
 # ==================== 主程序入口 ====================
+def main():
+    """主函数 - 包含错误处理和清理"""
+    try:
+        best_design, best_metric = optimize_gear_design()
+        print_results(best_design, best_metric)
+    except Exception as e:
+        print(f"\n{colorize(f'程序错误: {e}', Color.BRIGHT_RED)}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        # 最终清理
+        gc.collect()
+        print(colorize("程序结束", Color.BRIGHT_CYAN))
+
 if __name__ == '__main__':
-    best_design, best_metric = optimize_gear_design()
-    print_results(best_design, best_metric)
+    main()
