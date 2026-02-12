@@ -37,6 +37,10 @@ class MaterialCheckResult:
     # 混合材质配置 - 各齿轮实际使用的材质
     gear_materials: Dict[str, str] = None  # 如 {'z1': 'steel', 'z2': 'peek', ...}
     gear_material_names: Dict[str, str] = None  # 如 {'z1': '合金钢', 'z2': 'PEEK', ...}
+    # 齿顶修缘量 (mm)
+    tip_relief_amounts: Dict[str, float] = None  # 如 {'z1': 0.016, 'z2': 0.016, ...}
+    # 重合度
+    contact_ratios: Dict[str, float] = None  # 如 {'stage1': 2.5, 'stage2': 1.8}
     
     def __post_init__(self):
         if self.stress_details is None:
@@ -45,6 +49,10 @@ class MaterialCheckResult:
             self.gear_materials = {}
         if self.gear_material_names is None:
             self.gear_material_names = {}
+        if self.tip_relief_amounts is None:
+            self.tip_relief_amounts = {}
+        if self.contact_ratios is None:
+            self.contact_ratios = {}
 
 
 class MaterialDatabase:
@@ -63,11 +71,11 @@ class MaterialDatabase:
             name='PEEK (聚醚醚酮)',
             density=1.32e-6,
             sigma_f=90,
-            # sf_min_ratio=0.8,
+            sf_min_ratio=0.7,
             # 在高性能设计中，齿根厚系数可以降低到 0.65 - 0.7 左右，但建议不要盲目下探到 0.6 以下
             # 优化的齿形： 如果你采用了大压力角（如25度 而不是标准的 20度）或者齿顶修缘，
             # 齿根的自然厚度会增加，此时可以适当调小比例系数。
-            sf_min_ratio=0.3,#需要增加压力角（增加基部厚度）
+            # sf_min_ratio=0.3,#需要增加压力角（增加基部厚度）
             # safety_factor=2.5,
             safety_factor=2,
             color='米黄色'
@@ -76,17 +84,25 @@ class MaterialDatabase:
             name='POM (聚甲醛)',
             density=1.41e-6,
             sigma_f=65,
-            sf_min_ratio=1.0,
-            safety_factor=3.0,
+            sf_min_ratio=0.5,  # 调整为适配标准齿形
+            safety_factor=2.5,
             color='白色/黑色'
         ),
         'nylon': Material(
             name='尼龙66 (PA66)',
             density=1.15e-6,
             sigma_f=70,
-            sf_min_ratio=0.9,
-            safety_factor=2.8,
+            sf_min_ratio=0.5,  # 调整为适配标准齿形
+            safety_factor=2.5,
             color='乳白色'
+        ),
+        'peek_cf30': Material(
+            name='PEEK-CF30 (碳纤维增强)',
+            density=1.40e-6,      # 碳纤维增加密度
+            sigma_f=180,          # 强度提升约2倍
+            sf_min_ratio=0.55,    # 介于钢和普通PEEK之间
+            safety_factor=2.2,
+            color='黑色'
         )
     }
     
@@ -141,6 +157,65 @@ class StrengthChecker:
             self._sf_factor = math.pi / 2 * math.cos(alpha) - 2 * 1.25 * math.tan(alpha)
         return self._sf_factor
     
+    def calculate_contact_ratio(
+        self,
+        m: float,
+        z1: int,
+        z2: int,
+        pressure_angle: float = 20.0,
+        helix_angle: float = 0.0,
+        ha_coef: float = 1.0
+    ) -> Tuple[float, float, float]:
+        """
+        计算齿轮重合度
+        
+        Args:
+            m: 模数 (mm)
+            z1, z2: 两齿轮齿数
+            pressure_angle: 压力角 (度)
+            helix_angle: 螺旋角 (度)，0表示直齿轮
+            ha_coef: 齿顶高系数
+            
+        Returns:
+            (epsilon_alpha, epsilon_beta, epsilon_gamma): 
+            端面重合度、轴向重合度、总重合度
+        """
+        alpha_t = math.radians(pressure_angle)
+        beta = math.radians(helix_angle)
+        
+        # 端面压力角
+        if beta > 0:
+            alpha_t = math.atan(math.tan(alpha_t) / math.cos(beta))
+        
+        # 端面重合度 (直齿轮部分)
+        # 简化计算
+        ra1 = m * (z1/2 + ha_coef)  # 齿顶圆半径
+        ra2 = m * (z2/2 + ha_coef)
+        r1 = m * z1 / 2  # 分度圆半径
+        r2 = m * z2 / 2
+        rb1 = r1 * math.cos(alpha_t)  # 基圆半径
+        rb2 = r2 * math.cos(alpha_t)
+        
+        # 啮合线长度
+        pb = math.pi * m * math.cos(alpha_t)  # 基圆齿距
+        
+        # 端面重合度近似公式
+        epsilon_alpha = 1.88 - 3.2 * (1/z1 + 1/z2)
+        if beta > 0:  # 斜齿轮修正
+            epsilon_alpha *= math.cos(beta)
+        
+        # 轴向重合度 (仅斜齿轮)
+        epsilon_beta = 0.0
+        if beta > 0:
+            # 假设齿宽 b = 10 * m (标准齿宽系数)
+            b = 10 * m
+            epsilon_beta = b * math.sin(beta) / (math.pi * m)
+        
+        # 总重合度
+        epsilon_gamma = epsilon_alpha + epsilon_beta
+        
+        return epsilon_alpha, epsilon_beta, epsilon_gamma
+    
     def calculate_bending_stress(
         self,
         m: float,
@@ -148,12 +223,14 @@ class StrengthChecker:
         width: float,
         torque: float,
         Y_S: float = 1.0,
-        Y_epsilon: float = 0.7
-    ) -> Tuple[float, float]:
+        Y_epsilon: float = 0.7,
+        tip_relief: float = 0.0,
+        helix_angle: float = 0.0
+    ) -> Tuple[float, float, float, float]:
         """
         计算齿根弯曲应力
         
-        公式: σ_F = (2 * T * Y_F * Y_S * Y_ε) / (b * m² * z)
+        公式: σ_F = (2 * T * Y_F * Y_S * Y_ε * K_v * K_β) / (b * m² * z)
         
         Args:
             m: 模数 (mm)
@@ -162,23 +239,52 @@ class StrengthChecker:
             torque: 扭矩 (N·m)
             Y_S: 应力修正系数，默认1.0
             Y_epsilon: 重合度系数，默认0.7
+            tip_relief: 齿顶修缘系数 (0.0~0.05)，默认0.0不修缘
+            helix_angle: 螺旋角 (度)，默认0.0直齿轮
             
         Returns:
-            (sigma_F, Y_F): 弯曲应力(MPa)和齿形系数
+            (sigma_F, Y_F, K_v, K_beta): 弯曲应力(MPa)、齿形系数、动载系数、斜齿轮系数
         """
         if z < 12 or width <= 0 or m <= 0:
-            return float('inf'), 0.0
+            return float('inf'), 0.0, 1.0, 1.0
         
-        # 齿形系数（经验公式）
-        Y_F = 2.1 + 3.5 / z
+        # 齿形系数（经验公式，斜齿轮用当量齿数）
+        zv = z
+        if helix_angle > 0:
+            # 斜齿轮当量齿数
+            zv = z / (math.cos(math.radians(helix_angle)) ** 3)
+        Y_F = 2.1 + 3.5 / zv
         
         # 扭矩转 N·mm
         T = torque * 1000
         
-        # 弯曲应力
-        sigma_F = (2 * T * Y_F * Y_S * Y_epsilon) / (width * m**2 * z)
+        # 动载系数（修缘降低冲击）
+        K_v = max(0.85, 1.0 - 2.0 * tip_relief)
         
-        return sigma_F, Y_F
+        # 斜齿轮系数（螺旋角降低单位齿宽载荷）
+        K_beta = 1.0
+        if helix_angle > 0:
+            # 斜齿轮接触线倾斜，降低应力
+            K_beta = 0.85 + 0.01 * helix_angle  # 近似公式
+            K_beta = min(K_beta, 0.95)  # 最多降低5%
+        
+        # 弯曲应力
+        sigma_F = (2 * T * Y_F * Y_S * Y_epsilon * K_v * K_beta) / (width * m**2 * z)
+        
+        return sigma_F, Y_F, K_v, K_beta
+    
+    def calculate_tip_relief(self, m: float, tip_relief_coef: float) -> float:
+        """
+        计算齿顶修缘量
+        
+        Args:
+            m: 模数 (mm)
+            tip_relief_coef: 修缘系数
+            
+        Returns:
+            修缘量 (mm)
+        """
+        return m * tip_relief_coef
     
     def check_material(
         self,
@@ -321,7 +427,11 @@ class StrengthChecker:
         width2: float,
         torque1: float,
         torque2: float,
-        material_config: Dict[str, str]
+        material_config: Dict[str, str],
+        tip_relief1: float = 0.0,
+        tip_relief2: float = 0.0,
+        helix_angle1: float = 0.0,
+        helix_angle2: float = 0.0
     ) -> MaterialCheckResult:
         """
         混合材质校核 - 各齿轮可使用不同材质
@@ -334,6 +444,10 @@ class StrengthChecker:
             torque1: 第一级输入扭矩 (N·m)
             torque2: 第二级输入扭矩 (N·m)
             material_config: 材质配置字典, 如 {'z1': 'steel', 'z2': 'peek', ...}
+            tip_relief1: 第一级齿顶修缘系数
+            tip_relief2: 第二级齿顶修缘系数
+            helix_angle1: 第一级螺旋角 (度)，0表示直齿轮
+            helix_angle2: 第二级螺旋角 (度)，0表示直齿轮
             
         Returns:
             MaterialCheckResult: 校核结果（综合各材质情况）
@@ -344,12 +458,12 @@ class StrengthChecker:
         T3 = torque2
         T4 = torque2 * z4 / z3  # z4承受的扭矩
         
-        # 各齿轮参数
+        # 各齿轮参数 (增加修缘和螺旋角参数)
         gears = [
-            ('z1', m1, z1, width1, T1),
-            ('z2', m1, z2, width1, T2),
-            ('z3', m2, z3, width2, T3),
-            ('z4', m2, z4, width2, T4)
+            ('z1', m1, z1, width1, T1, tip_relief1, helix_angle1),
+            ('z2', m1, z2, width1, T2, tip_relief1, helix_angle1),
+            ('z3', m2, z3, width2, T3, tip_relief2, helix_angle2),
+            ('z4', m2, z4, width2, T4, tip_relief2, helix_angle2)
         ]
         
         # 计算各齿轮应力和校核
@@ -359,17 +473,27 @@ class StrengthChecker:
         all_suitable = True
         max_stress_ratio = 0
         total_density_weighted = 0
+        relief_amounts = {}  # 记录修缘量
         
-        for gear_key, m, z, width, torque in gears:
+        # 计算重合度（用于报告）
+        _, _, epsilon_gamma1 = self.calculate_contact_ratio(m1, z1, z2, helix_angle=helix_angle1)
+        _, _, epsilon_gamma2 = self.calculate_contact_ratio(m2, z3, z4, helix_angle=helix_angle2)
+        
+        for gear_key, m, z, width, torque, tip_relief, helix_angle in gears:
             # 获取该齿轮的材质
             mat_key = material_config.get(gear_key, 'steel')
             material = db.get(mat_key)
             if material is None:
                 material = db['steel']  # 默认用钢
             
-            # 计算应力
-            sigma_F, _ = self.calculate_bending_stress(m, z, width, torque)
+            # 计算应力（考虑修缘和螺旋角）
+            sigma_F, _, K_v, K_beta = self.calculate_bending_stress(
+                m, z, width, torque, tip_relief=tip_relief, helix_angle=helix_angle
+            )
             stress_details[f'{gear_key}({self._get_gear_desc(gear_key)})'] = sigma_F
+            
+            # 记录修缘量
+            relief_amounts[gear_key] = self.calculate_tip_relief(m, tip_relief)
             
             # 许用应力
             sigma_F_allow = material.sigma_f / material.safety_factor
@@ -421,10 +545,12 @@ class StrengthChecker:
             sf_ratio_ok=all_suitable,  # 已在各齿轮检查中包含
             suitable=all_suitable,
             safety_margin=safety_margin,
-            density=total_density_weighted / sum(z * width * m**2 for _, m, z, width, _ in gears),
+            density=total_density_weighted / sum(z * width * m**2 for _, m, z, width, _, _, _ in gears),
             stress_details=stress_details,
             gear_materials=gear_materials,
-            gear_material_names=gear_material_names
+            gear_material_names=gear_material_names,
+            tip_relief_amounts=relief_amounts,
+            contact_ratios={'stage1': epsilon_gamma1, 'stage2': epsilon_gamma2}
         )
     
     def _get_gear_desc(self, gear_key: str) -> str:

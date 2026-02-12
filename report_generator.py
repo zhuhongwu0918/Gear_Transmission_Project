@@ -36,6 +36,12 @@ class GearResult:
     max_stress_gear: str = ""
     gear_materials: dict = None
     gear_material_names: dict = None
+    tip_relief_amounts: dict = None
+    tip_relief1: float = 0.0
+    tip_relief2: float = 0.0
+    helix_angle1: float = 0.0
+    helix_angle2: float = 0.0
+    contact_ratios: dict = None
     
     def __post_init__(self):
         if self.stress_details is None:
@@ -44,6 +50,10 @@ class GearResult:
             self.gear_materials = {}
         if self.gear_material_names is None:
             self.gear_material_names = {}
+        if self.tip_relief_amounts is None:
+            self.tip_relief_amounts = {}
+        if self.contact_ratios is None:
+            self.contact_ratios = {}
 
 
 @dataclass
@@ -144,37 +154,69 @@ class ReportGenerator:
         mat_z3 = r.gear_material_names.get('z3', '合金钢 (20CrMnTi)')
         mat_z4 = r.gear_material_names.get('z4', '合金钢 (20CrMnTi)')
         
+        # 获取修缘量
+        relief1 = r.tip_relief_amounts.get('z1', 0) if r.tip_relief_amounts else 0
+        relief2 = r.tip_relief_amounts.get('z2', 0) if r.tip_relief_amounts else 0
+        relief3 = r.tip_relief_amounts.get('z3', 0) if r.tip_relief_amounts else 0
+        relief4 = r.tip_relief_amounts.get('z4', 0) if r.tip_relief_amounts else 0
+        
+        # 修缘信息字符串
+        relief_info1 = f", 齿顶修缘 = {relief1:.3f} mm" if relief1 > 0 else ""
+        relief_info2 = f", 齿顶修缘 = {relief2:.3f} mm" if relief2 > 0 else ""
+        relief_info3 = f", 齿顶修缘 = {relief3:.3f} mm" if relief3 > 0 else ""
+        relief_info4 = f", 齿顶修缘 = {relief4:.3f} mm" if relief4 > 0 else ""
+        
+        # 获取重合度
+        epsilon1 = r.contact_ratios.get('stage1', 1.4) if r.contact_ratios else 1.4
+        epsilon2 = r.contact_ratios.get('stage2', 1.4) if r.contact_ratios else 1.4
+        
         print(f"\n┌{'─' * 54}┐")
         print(f"│ {'第一级 (高速级)':^52} │")
         print(f"├{self.hline_blue}┤")
+        
+        # 第一级类型标识
+        stage1_type = "斜齿轮" if r.helix_angle1 > 0 else "直齿轮"
+        helix_info1 = f" (螺旋角={r.helix_angle1}°)" if r.helix_angle1 > 0 else ""
+        print(f"│  类型: {stage1_type}{helix_info1}, 重合度 ε = {epsilon1:.2f}")
+        
         print(f"│  模数 m1 = {r.m1} mm, 齿距 p1 = {self.p1:.3f} mm")
         print(f"│  齿顶高 = {self.ha1:.2f} mm, 齿根高 = {self.hf1:.2f} mm, 总齿高 = {self.h1:.2f} mm")
         print(f"│  齿宽系数 = {r.width_factor1}, 轴向厚度(齿宽) = {self.width1:.2f} mm")
         print(f"│  危险截面齿根宽 sf1 = {self.sf1:.3f} mm (sf/m = {self.sf_factor:.3f})")
+        if r.tip_relief1 > 0:
+            print(f"│  齿顶修缘系数 = {r.tip_relief1}, 修缘量 = {relief1:.3f} mm ✓降噪")
         print(f"│")
         print(f"│  主动轮: 齿数 z1 = {r.z1}, 分度圆直径 D1 = {r.d1:.2f} mm, 齿轮厚度 = {self.width1:.2f} mm")
-        print(f"│          材质: {mat_z1}")
+        print(f"│          材质: {mat_z1}{relief_info1}")
         print(f"│          齿根圆直径 = {self.df1:.2f} mm")
         print(f"│          输入扭矩 = {self.T1_input:.3f} N·m")
         print(f"│  从动轮: 齿数 z2 = {r.z2}, 分度圆直径 D2 = {r.d2:.2f} mm, 齿轮厚度 = {self.width1:.2f} mm")
-        print(f"│          材质: {mat_z2}")
+        print(f"│          材质: {mat_z2}{relief_info2}")
         print(f"│          齿根圆直径 = {self.df2:.2f} mm")
         print(f"│          输出扭矩 = {self.T1_output:.3f} N·m")
         print(f"│  传动比 i1 = {self.i1:.3f}")
         print(f"│")
         print(f"│ {'第二级 (低速级)':^52} │")
         print(f"├{self.hline_blue}┤")
+        
+        # 第二级类型标识
+        stage2_type = "斜齿轮" if r.helix_angle2 > 0 else "直齿轮"
+        helix_info2 = f" (螺旋角={r.helix_angle2}°)" if r.helix_angle2 > 0 else ""
+        print(f"│  类型: {stage2_type}{helix_info2}, 重合度 ε = {epsilon2:.2f}")
+        
         print(f"│  模数 m2 = {r.m2} mm, 齿距 p2 = {self.p2:.3f} mm")
         print(f"│  齿顶高 = {self.ha2:.2f} mm, 齿根高 = {self.hf2:.2f} mm, 总齿高 = {self.h2:.2f} mm")
         print(f"│  齿宽系数 = {r.width_factor2}, 轴向厚度(齿宽) = {self.width2:.2f} mm")
         print(f"│  危险截面齿根宽 sf2 = {self.sf2:.3f} mm (sf/m = {self.sf_factor:.3f})")
+        if r.tip_relief2 > 0:
+            print(f"│  齿顶修缘系数 = {r.tip_relief2}, 修缘量 = {relief3:.3f} mm ✓降噪")
         print(f"│")
         print(f"│  主动轮: 齿数 z3 = {r.z3}, 分度圆直径 D3 = {r.d3:.2f} mm, 齿轮厚度 = {self.width2:.2f} mm")
-        print(f"│          材质: {mat_z3}")
+        print(f"│          材质: {mat_z3}{relief_info3}")
         print(f"│          齿根圆直径 = {self.df3:.2f} mm")
         print(f"│          输入扭矩 = {self.T2_input:.3f} N·m")
         print(f"│  从动轮: 齿数 z4 = {r.z4}, 分度圆直径 D4 = {r.d4:.2f} mm, 齿轮厚度 = {self.width2:.2f} mm")
-        print(f"│          材质: {mat_z4}")
+        print(f"│          材质: {mat_z4}{relief_info4}")
         print(f"│          齿根圆直径 = {self.df4:.2f} mm")
         print(f"│          输出扭矩 = {self.T2_output:.3f} N·m")
         print(f"│  传动比 i2 = {self.i2:.3f}")
@@ -342,7 +384,13 @@ def print_result(result, config):
         stress_details=result.stress_details,
         max_stress_gear=result.max_stress_gear,
         gear_materials=result.gear_materials,
-        gear_material_names=result.gear_material_names
+        gear_material_names=result.gear_material_names,
+        tip_relief_amounts=result.tip_relief_amounts,
+        tip_relief1=result.tip_relief1,
+        tip_relief2=result.tip_relief2,
+        helix_angle1=result.helix_angle1,
+        helix_angle2=result.helix_angle2,
+        contact_ratios=result.contact_ratios
     )
     
     report_config = GearConfig(

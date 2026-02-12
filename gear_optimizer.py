@@ -26,37 +26,55 @@ class GearConfig:
     output_torque: float = 5.0     # 输出扭矩要求 (Nm)
     max_motor_speed: float = 4000  # 电机最大转速 (rpm)
     output_speed: float = 350      # 输出转速 (rpm)
-    
     # 结构约束
     motor_diameter: float = 75     # 电机直径 (mm)
     min_clearance: float = 1.0     # D1-D3最小间隙 (mm)
     min_teeth: int = 17            # 最小齿数
-    
     # 扫描范围
     d1_range: tuple = (15, 30)     # 一级主动轮直径范围
     d2_range: tuple = (50, 120)    # 一级从动轮直径范围
     d3_range: tuple = (10, 40)     # 二级主动轮直径范围
     d4_range: tuple = (30, 80)     # 二级从动轮直径范围
     step: int = 2                  # 扫描步长 (mm)
-    
     # 模数选项
-    m1_options: tuple = (1.0, 1.2) # 增大模数,增大齿根绝对厚度
+    # m1_options: tuple = (1.0, 1.2) # 增大模数,增大齿根绝对厚度
+    # 增大齿数，减小模数（保持直径不变）
+    m1_options: tuple = (0.6, 0.8, 1.0)  # 从 0.8 减小
+    # 对应齿数增加：z1=34, z2=112（直径仍约 17mm/56mm）
+    # 重合度从 1.4 提升到 1.7，噪音降低
     m2_options: tuple = (0.8, 1.0, 1.5)
     
     # 齿宽系数列表 (常用值: 6, 8, 10, 12, 15)，分别控制两级齿轮厚度
-    width_factors1: tuple = (10, 12, 15)  # 第一级齿宽系数（可以更大，因为第一级扭矩小）
+    width_factors1: tuple = (12, 15, 18)  # 第一级齿宽系数（可以更大，因为第一级扭矩小）
     width_factors2: tuple = (6, 8, 10)       # 第二级齿宽系数
-    
     # 混合材质配置 - 可为每个齿轮指定不同材质
-    # 可选: 'steel'(钢), 'peek'(PEEK), 'pom'(POM), 'nylon'(尼龙)
+    # 可选: 'steel'(钢), 'peek'(PEEK), 'pom'(POM), 'nylon'(尼龙), 'peek_cf30'
     # 默认: 全部用钢
+    # === 方案A: 第一级从动轮用塑料降噪 ===
     material_z1: str = 'steel'  # 第一级主动轮
-    material_z2: str = 'steel'  # 第一级从动轮  <- 可改为 'peek' 使用塑料
+    material_z2: str = 'peek_cf30'    # 第一级从动轮  <- 'pom'或'nylon'降噪，'peek_cf30'高强度
     material_z3: str = 'steel'  # 第二级主动轮
     material_z4: str = 'steel'  # 第二级从动轮
     
+    # 齿顶修缘参数（降低啮合冲击噪音）
+    # 修缘量 = tip_relief * m (模数)
+    # 推荐值: 0.0~0.05，0.02~0.03效果较好，0表示不修缘
+    tip_relief1: float = 0.02   # 第一级修缘系数 (修缘量 = 0.02 * m1)
+    tip_relief2: float = 0.02   # 第二级修缘系数 (修缘量 = 0.02 * m2)
+    
+    # 斜齿轮参数（第一级使用斜齿轮可显著降低噪音）
+    # 螺旋角推荐值: 8°~20°，常用15°
+    # 0°表示直齿轮
+    helix_angle1: float = 15.0  # 第一级螺旋角 (度)，0表示直齿轮
+    helix_angle2: float = 0.0   # 第二级螺旋角 (度)，0表示直齿轮
+    
+    # 材料校核模式
+    # True = 硬约束: 所有指定材质必须满足强度要求，否则方案无效
+    # False = 软约束: 允许自动切换材质以满足强度 (默认)
+    strict_material_check: bool = True  # 设为True启用硬约束模式
+    
     # 优化目标
-    optimize_mode: str = 'size'    # 'size'或'weight'
+    optimize_mode: str = 'weight'    # 'size'或'weight'
     
     # 其他
     motor_weight: float = 300      # 电机重量 (g)
@@ -90,6 +108,12 @@ class GearResult:
     max_stress_gear: str = ""  # 最大应力所在齿轮
     gear_materials: Dict[str, str] = None  # 各齿轮材质键名
     gear_material_names: Dict[str, str] = None  # 各齿轮材质名称
+    tip_relief_amounts: Dict[str, float] = None  # 各齿轮修缘量(mm)
+    tip_relief1: float = 0.0  # 第一级修缘系数
+    tip_relief2: float = 0.0  # 第二级修缘系数
+    helix_angle1: float = 0.0  # 第一级螺旋角
+    helix_angle2: float = 0.0  # 第二级螺旋角
+    contact_ratios: Dict[str, float] = None  # 重合度
     
     def __post_init__(self):
         if self.stress_details is None:
@@ -98,6 +122,10 @@ class GearResult:
             self.gear_materials = {}
         if self.gear_material_names is None:
             self.gear_material_names = {}
+        if self.tip_relief_amounts is None:
+            self.tip_relief_amounts = {}
+        if self.contact_ratios is None:
+            self.contact_ratios = {}
 
 
 # ==================== 核心优化器 ====================
@@ -116,24 +144,30 @@ class GearOptimizer:
         self.material_db = MaterialDatabase()
         self.strength_checker = StrengthChecker(config.pressure_angle)
         
-    def evaluate(self, m1: float, m2: float, d1_in: int, d2_in: int, 
-                 d3_in: int, d4_in: int, wf1: float, wf2: float) -> Optional[GearResult]:
+    def evaluate(self, m1: float, m2: float, d1_in: int, d2_in: int,
+                 d3_in: int, d4_in: int, wf1: float, wf2: float, 
+                 stats: dict = None) -> Optional[GearResult]:
         """
         评估单个设计组合
-        
+
+        Args:
+            stats: 可选的统计字典，记录失败原因
+
         Returns:
             GearResult if valid, None otherwise
         """
         cfg = self.config
-        
+
         # 1. 计算齿数
         z1 = round(d1_in / m1)
         z2 = round(d2_in / m1)
         z3 = round(d3_in / m2)
         z4 = round(d4_in / m2)
-        
+
         # 2. 齿数约束
         if min(z1, z2, z3, z4) < cfg.min_teeth:
+            if stats:
+                stats['teeth'] += 1
             return None
         
         # 3. 实际直径
@@ -149,19 +183,27 @@ class GearOptimizer:
         
         # 5. 转速约束
         if cfg.output_speed * ratio > cfg.max_motor_speed:
+            if stats:
+                stats['speed'] += 1
             return None
-        
+
         # 6. 扭矩约束
         actual_torque = cfg.motor_torque * ratio * 0.9025  # 0.95^2
         if actual_torque < cfg.output_torque:
+            if stats:
+                stats['torque'] += 1
             return None
-        
+
         # 7. 包络约束
         if max(d2, d4) > cfg.motor_diameter:
+            if stats:
+                stats['envelope'] += 1
             return None
-        
+
         # 8. 间隙约束
         if (d1 - d3) < cfg.min_clearance:
+            if stats:
+                stats['clearance'] += 1
             return None
         
         # 9. 材料校核（支持混合材质）
@@ -181,21 +223,51 @@ class GearOptimizer:
         # 检查是否使用混合材质
         unique_materials = set(material_config.values())
         if len(unique_materials) > 1:
-            # 使用混合材质校核
+            # 使用混合材质校核（传递修缘和螺旋角参数）
             result = self.strength_checker.check_mixed_materials(
                 self.material_db, m1, m2, z1, z2, z3, z4,
-                width1, width2, torque1, torque2, material_config
+                width1, width2, torque1, torque2, material_config,
+                tip_relief1=cfg.tip_relief1, tip_relief2=cfg.tip_relief2,
+                helix_angle1=cfg.helix_angle1, helix_angle2=cfg.helix_angle2
             )
+            
+            # 硬约束模式：检查每个指定材质是否都满足
+            if cfg.strict_material_check and result.gear_materials:
+                for gear_key, mat_key in material_config.items():
+                    actual_mat = result.gear_materials.get(gear_key, '')
+                    # 如果实际材质与指定材质不一致，说明指定材质不满足
+                    if actual_mat != mat_key:
+                        if stats:
+                            stats['strict_mat'] += 1
+                        return None  # 硬约束：指定材质不满足，方案无效
         else:
-            # 使用单一材质校核（原有逻辑）
-            selected_key, results = self.strength_checker.select_best_material(
-                self.material_db, m1, m2, z1, z2, z3, z4,
-                width1, width2, torque1, torque2, mode='auto'
-            )
-            result = results[selected_key]
+            # 单一材质配置
+            specified_material = list(unique_materials)[0]
+
+            if cfg.strict_material_check:
+                # 硬约束模式：只校核指定材质，不允许自动切换
+                selected_key, results = self.strength_checker.select_best_material(
+                    self.material_db, m1, m2, z1, z2, z3, z4,
+                    width1, width2, torque1, torque2, mode=specified_material
+                )
+                result = results[specified_material]
+                # 检查指定材质是否满足
+                if not result.suitable:
+                    if stats:
+                        stats['strict_mat'] += 1
+                    return None  # 指定材质不满足，方案无效
+            else:
+                # 软约束模式：允许自动选择最优材质
+                selected_key, results = self.strength_checker.select_best_material(
+                    self.material_db, m1, m2, z1, z2, z3, z4,
+                    width1, width2, torque1, torque2, mode='auto'
+                )
+                result = results[selected_key]
         
-        # 检查是否有材料满足
+        # 检查是否有材料满足（通用检查）
         if not result.suitable:
+            if stats:
+                stats['material'] += 1
             return None  # 没有材料满足
         
         # 找出最大应力所在齿轮
@@ -243,7 +315,13 @@ class GearOptimizer:
             stress_details=result.stress_details,
             max_stress_gear=max_stress_gear,
             gear_materials=result.gear_materials,
-            gear_material_names=result.gear_material_names
+            gear_material_names=result.gear_material_names,
+            tip_relief_amounts=result.tip_relief_amounts,
+            tip_relief1=cfg.tip_relief1,
+            tip_relief2=cfg.tip_relief2,
+            helix_angle1=cfg.helix_angle1,
+            helix_angle2=cfg.helix_angle2,
+            contact_ratios=result.contact_ratios
         )
     
     def optimize(self, progress_interval: int = 10000) -> tuple:
@@ -275,6 +353,10 @@ class GearOptimizer:
         print(f"第一级齿宽系数: {cfg.width_factors1}")
         print(f"第二级齿宽系数: {cfg.width_factors2}")
         print(f"优化目标: {'纵向尺寸最短' if cfg.optimize_mode == 'size' else '重量最轻'}")
+        if cfg.strict_material_check:
+            print(f"材料校核模式: 硬约束 (必须满足指定材质)")
+            print(f"  第一级: z1={cfg.material_z1}, z2={cfg.material_z2}")
+            print(f"  第二级: z3={cfg.material_z3}, z4={cfg.material_z4}")
         print()
         
         best_result = None
@@ -282,6 +364,17 @@ class GearOptimizer:
         valid_count = 0
         completed = 0
         start_time = time.time()
+        
+        # 失败原因统计
+        failure_stats = {
+            'teeth': 0,        # 齿数不足
+            'speed': 0,        # 转速超限
+            'torque': 0,       # 扭矩不足
+            'envelope': 0,     # 包络约束
+            'clearance': 0,    # 间隙约束
+            'material': 0,     # 材料强度
+            'strict_mat': 0,   # 硬约束材质
+        }
         
         # 搜索
         for m1 in cfg.m1_options:
@@ -292,32 +385,49 @@ class GearOptimizer:
                             for d4 in d4_list:
                                 for wf1 in cfg.width_factors1:
                                     for wf2 in cfg.width_factors2:
-                                        result = self.evaluate(m1, m2, d1, d2, d3, d4, wf1, wf2)
+                                        result = self.evaluate(m1, m2, d1, d2, d3, d4, wf1, wf2, failure_stats)
                                         completed += 1
-                                        
+
                                         if result:
                                             valid_count += 1
                                             metric = (
-                                                result.total_size 
-                                                if cfg.optimize_mode == 'size' 
+                                                result.total_size
+                                                if cfg.optimize_mode == 'size'
                                                 else result.weight_g
                                             )
                                             if metric < best_metric:
                                                 best_metric = metric
                                                 best_result = result
-                                        
+
                                         # 进度报告
                                         if completed % progress_interval == 0:
                                             progress = completed / total_count * 100
                                             elapsed = time.time() - start_time
-                                            eta = (elapsed / progress * (100 - progress) 
+                                            eta = (elapsed / progress * (100 - progress)
                                                    if progress > 0 else 0)
                                             print(f"\r进度: {completed}/{total_count} "
                                                   f"({progress:.1f}%) | "
                                                   f"可行: {valid_count} | "
                                                   f"ETA: {eta:.0f}s", end='', flush=True)
-        
+
         print()  # 换行
+
+        # 打印失败统计（仅在硬约束模式或调试时显示）
+        if cfg.strict_material_check or sum(failure_stats.values()) > 0:
+            print("\n【约束失败统计】")
+            total_failures = sum(failure_stats.values())
+            if total_failures > 0:
+                print(f"  齿数不足:  {failure_stats['teeth']:,} ({failure_stats['teeth']/total_failures*100:.1f}%)")
+                print(f"  转速超限:  {failure_stats['speed']:,} ({failure_stats['speed']/total_failures*100:.1f}%)")
+                print(f"  扭矩不足:  {failure_stats['torque']:,} ({failure_stats['torque']/total_failures*100:.1f}%)")
+                print(f"  包络约束:  {failure_stats['envelope']:,} ({failure_stats['envelope']/total_failures*100:.1f}%)")
+                print(f"  间隙约束:  {failure_stats['clearance']:,} ({failure_stats['clearance']/total_failures*100:.1f}%)")
+                print(f"  材料强度:  {failure_stats['material']:,} ({failure_stats['material']/total_failures*100:.1f}%)")
+                if cfg.strict_material_check:
+                    print(f"  硬约束材质不满足: {failure_stats['strict_mat']:,} ({failure_stats['strict_mat']/total_failures*100:.1f}%)")
+            else:
+                print("  所有方案均通过约束检查")
+
         return best_result, valid_count, total_count
 
 
