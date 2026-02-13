@@ -8,6 +8,9 @@ import math
 from typing import Optional
 from dataclasses import dataclass
 
+# 导入材料数据库
+from material_check import MaterialDatabase
+
 
 @dataclass
 class GearResult:
@@ -42,6 +45,8 @@ class GearResult:
     helix_angle1: float = 0.0
     helix_angle2: float = 0.0
     contact_ratios: dict = None
+    stress_ratios: dict = None
+    max_stress_ratio_gear: str = ""
     
     def __post_init__(self):
         if self.stress_details is None:
@@ -54,6 +59,8 @@ class GearResult:
             self.tip_relief_amounts = {}
         if self.contact_ratios is None:
             self.contact_ratios = {}
+        if self.stress_ratios is None:
+            self.stress_ratios = {}
 
 
 @dataclass
@@ -275,9 +282,6 @@ class ReportGenerator:
         """打印材料强度校核"""
         r = self.result
         
-        stress_ratio = r.max_stress / r.allow_stress
-        stress_status = "✓ 安全" if stress_ratio < 1.0 else "✗ 超限"
-        
         # 解析最大应力位置
         max_gear_name = r.max_stress_gear if r.max_stress_gear else "未知"
         
@@ -286,38 +290,74 @@ class ReportGenerator:
         print(f"├{self.hline_blue}┤")
         print(f"│ 选定材质: {r.material_name}")
         print(f"│")
-        print(f"│ 【各齿轮弯曲应力详情】")
         
-        # 打印各齿轮应力
-        if r.stress_details:
+        # 打印各齿轮使用的材料参数
+        if r.gear_materials:
+            db = MaterialDatabase()
+            print(f"│ 【各齿轮材料参数详情】")
+            print(f"│ 齿轮  │ 材料名称              │ σ_f(MPa)│ sf_min │ 安全系数 │ 许用应力(MPa)")
+            print(f"│ {'─'*52}")
+            for gear_key, mat_key in r.gear_materials.items():
+                material = db.get(mat_key)
+                if material:
+                    allow_stress = material.sigma_f / material.safety_factor
+                    gear_desc = {
+                        'z1': 'z1(一级主动)',
+                        'z2': 'z2(一级从动)',
+                        'z3': 'z3(二级主动)',
+                        'z4': 'z4(二级从动)'
+                    }.get(gear_key, gear_key)
+                    print(f"│ {gear_desc:7}│ {material.name:20} │ {material.sigma_f:6.1f}  │ {material.sf_min_ratio:5.2f}  │   {material.safety_factor:4.1f}   │   {allow_stress:6.1f}")
+            print(f"│")
+            # 打印齿根厚系数参考值
+            print(f"│ 注: 标准20°压力角齿根厚系数 sf/m = {self.sf_factor:.3f}")
+            print(f"│")
+        
+        print(f"│ 【各齿轮弯曲应力与应力比详情】")
+        
+        # 找出最大应力比齿轮
+        max_ratio_gear = ""
+        max_ratio_value = 0
+        if r.stress_ratios:
+            max_ratio_gear = max(r.stress_ratios.items(), key=lambda x: x[1])[0]
+            max_ratio_value = r.stress_ratios[max_ratio_gear]
+        
+        # 打印各齿轮应力和应力比
+        if r.stress_details and r.stress_ratios:
             # 第一级啮合对
             s1 = r.stress_details.get('z1(一级主动)', 0)
             s2 = r.stress_details.get('z2(一级从动)', 0)
-            pair1_max = max(s1, s2)
-            marker1 = " ← 最大" if r.max_stress_gear in ['z1(一级主动)', 'z2(一级从动)'] else ""
+            r1 = r.stress_ratios.get('z1(一级主动)', 0)
+            r2 = r.stress_ratios.get('z2(一级从动)', 0)
+            marker1 = " ← 应力比最大" if max_ratio_gear == 'z1(一级主动)' else ""
+            marker2 = " ← 应力比最大" if max_ratio_gear == 'z2(一级从动)' else ""
             print(f"│  第一级啮合 (z1-z2):")
-            print(f"│    z1 主动轮: {s1:.1f} MPa")
-            print(f"│    z2 从动轮: {s2:.1f} MPa")
-            print(f"│    啮合最大: {pair1_max:.1f} MPa{marker1}")
+            print(f"│    z1 主动轮: {s1:.1f} MPa, 应力比={r1:.2f}{marker1}")
+            print(f"│    z2 从动轮: {s2:.1f} MPa, 应力比={r2:.2f}{marker2}")
             print(f"│")
             
             # 第二级啮合对
             s3 = r.stress_details.get('z3(二级主动)', 0)
             s4 = r.stress_details.get('z4(二级从动)', 0)
-            pair2_max = max(s3, s4)
-            marker2 = " ← 最大" if r.max_stress_gear in ['z3(二级主动)', 'z4(二级从动)'] else ""
+            r3 = r.stress_ratios.get('z3(二级主动)', 0)
+            r4 = r.stress_ratios.get('z4(二级从动)', 0)
+            marker3 = " ← 应力比最大" if max_ratio_gear == 'z3(二级主动)' else ""
+            marker4 = " ← 应力比最大" if max_ratio_gear == 'z4(二级从动)' else ""
             print(f"│  第二级啮合 (z3-z4):")
-            print(f"│    z3 主动轮: {s3:.1f} MPa")
-            print(f"│    z4 从动轮: {s4:.1f} MPa")
-            print(f"│    啮合最大: {pair2_max:.1f} MPa{marker2}")
+            print(f"│    z3 主动轮: {s3:.1f} MPa, 应力比={r3:.2f}{marker3}")
+            print(f"│    z4 从动轮: {s4:.1f} MPa, 应力比={r4:.2f}{marker4}")
         
         print(f"│")
         print(f"│ 【应力校核总结】")
         print(f"│ 最大应力位置: {max_gear_name}")
+        if max_ratio_gear:
+            # 使用最大应力比来判断状态，与硬约束检查逻辑一致
+            stress_status = "✓ 安全" if max_ratio_value <= 1.0 else "✗ 超限"
+            print(f"│ 最大应力比位置: {max_ratio_gear}")
+            print(f"│ 最大应力比: {max_ratio_value:.2f} {stress_status}")
         print(f"│ 最大弯曲应力: {r.max_stress:.1f} MPa")
-        print(f"│ 许用弯曲应力: {r.allow_stress:.1f} MPa")
-        print(f"│ 应力比: {stress_ratio:.2f} {stress_status}")
-        print(f"│ 安全裕度: {r.allow_stress/r.max_stress:.2f}")
+        print(f"│ (各齿轮按自身材质许用应力校核)")
+        print(f"│ 安全裕度: {1.0/max_ratio_value:.2f}" if max_ratio_value > 0 else "│ 安全裕度: --")
         print(f"└{'─' * 54}┘")
     
     def _print_validation(self):
@@ -329,9 +369,11 @@ class ReportGenerator:
         print(f"│ {'设计验证':^52} │")
         print(f"├{self.hline_blue}┤")
         print(f"│ 轴距约束验证: ✓ 通过")
-        clearance = r.d1 - r.d3
-        clearance_ok = "✓ 通过" if clearance >= c.min_clearance else "✗ 失败"
-        print(f"│ 齿轮间隙验证 (D1-D3 >= {c.min_clearance}mm): {clearance:.2f} mm 【{clearance_ok}】")
+        # 新间隙约束: ((D1+D2)-(motor_diameter+D3)) > min_clearance
+        clearance = (r.d1 + r.d2) - (c.motor_diameter + r.d3)
+        clearance_ok = "✓ 通过" if clearance > c.min_clearance else "✗ 失败"
+        print(f"│ 齿轮间隙验证 (((D1+D2)-(电机直径+D3)) > {c.min_clearance}mm):")
+        print(f"│   计算: (({r.d1:.2f}+{r.d2:.2f})-({c.motor_diameter:.2f}+{r.d3:.2f})) = {clearance:.2f} mm 【{clearance_ok}】")
         strength_factor = (r.m2 * self.width2) / (r.m1 * self.width1)
         strength_note = ">1.0表示低速级更强"
         print(f"│ 低速级相对强度系数: {strength_factor:.2f} ({strength_note})")
@@ -390,7 +432,9 @@ def print_result(result, config):
         tip_relief2=result.tip_relief2,
         helix_angle1=result.helix_angle1,
         helix_angle2=result.helix_angle2,
-        contact_ratios=result.contact_ratios
+        contact_ratios=result.contact_ratios,
+        stress_ratios=result.stress_ratios,
+        max_stress_ratio_gear=result.max_stress_ratio_gear
     )
     
     report_config = GearConfig(

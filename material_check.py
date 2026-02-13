@@ -41,6 +41,10 @@ class MaterialCheckResult:
     tip_relief_amounts: Dict[str, float] = None  # 如 {'z1': 0.016, 'z2': 0.016, ...}
     # 重合度
     contact_ratios: Dict[str, float] = None  # 如 {'stage1': 2.5, 'stage2': 1.8}
+    # 各齿轮应力比 (应力/许用应力)
+    stress_ratios: Dict[str, float] = None  # 如 {'z1': 0.45, 'z2': 0.52, ...}
+    # 最大应力比所在齿轮
+    max_stress_ratio_gear: str = ""  # 如 'z3(二级主动)'
     
     def __post_init__(self):
         if self.stress_details is None:
@@ -53,6 +57,8 @@ class MaterialCheckResult:
             self.tip_relief_amounts = {}
         if self.contact_ratios is None:
             self.contact_ratios = {}
+        if self.stress_ratios is None:
+            self.stress_ratios = {}
 
 
 class MaterialDatabase:
@@ -101,6 +107,7 @@ class MaterialDatabase:
             density=1.40e-6,      # 碳纤维增加密度
             sigma_f=180,          # 强度提升约2倍
             sf_min_ratio=0.55,    # 介于钢和普通PEEK之间
+            # sf_min_ratio=0.7,    # 增加齿的基部厚度
             safety_factor=2.2,
             color='黑色'
         )
@@ -472,8 +479,10 @@ class StrengthChecker:
         gear_material_names = {}
         all_suitable = True
         max_stress_ratio = 0
+        max_stress_ratio_gear = ""
         total_density_weighted = 0
         relief_amounts = {}  # 记录修缘量
+        stress_ratios = {}  # 记录各齿轮应力比
         
         # 计算重合度（用于报告）
         _, _, epsilon_gamma1 = self.calculate_contact_ratio(m1, z1, z2, helix_angle=helix_angle1)
@@ -490,7 +499,8 @@ class StrengthChecker:
             sigma_F, _, K_v, K_beta = self.calculate_bending_stress(
                 m, z, width, torque, tip_relief=tip_relief, helix_angle=helix_angle
             )
-            stress_details[f'{gear_key}({self._get_gear_desc(gear_key)})'] = sigma_F
+            gear_desc = f'{gear_key}({self._get_gear_desc(gear_key)})'
+            stress_details[gear_desc] = sigma_F
             
             # 记录修缘量
             relief_amounts[gear_key] = self.calculate_tip_relief(m, tip_relief)
@@ -513,9 +523,14 @@ class StrengthChecker:
             gear_materials[gear_key] = mat_key
             gear_material_names[gear_key] = material.name
             
-            # 计算最大应力比（用于评估整体安全裕度）
+            # 计算应力比并记录
             stress_ratio = sigma_F / sigma_F_allow if sigma_F_allow > 0 else float('inf')
-            max_stress_ratio = max(max_stress_ratio, stress_ratio)
+            stress_ratios[gear_desc] = stress_ratio
+            
+            # 追踪最大应力比
+            if stress_ratio > max_stress_ratio:
+                max_stress_ratio = stress_ratio
+                max_stress_ratio_gear = gear_desc
             
             # 加权平均密度（按体积近似估算）
             total_density_weighted += material.density * (z * width * m**2)
@@ -523,13 +538,20 @@ class StrengthChecker:
         # 最大应力
         max_sigma_F = max(stress_details.values())
         
-        # 取最严格的许用应力作为整体许用（保守估计）
-        min_allow_stress = min(
-            db[gear_materials[g]].sigma_f / db[gear_materials[g]].safety_factor 
-            for g in gear_materials
-        )
+        # 取最大应力齿轮的许用应力作为参考（与最大应力对应）
+        max_stress_gear_key = max(stress_details.items(), key=lambda x: x[1])[0]
+        max_stress_gear_short = max_stress_gear_key.split('(')[0]  # 提取 z1, z2 等
+        if max_stress_gear_short in gear_materials:
+            ref_material = db[gear_materials[max_stress_gear_short]]
+            ref_allow_stress = ref_material.sigma_f / ref_material.safety_factor
+        else:
+            # 备选：取所有许用应力的平均值
+            ref_allow_stress = sum(
+                db[gear_materials[g]].sigma_f / db[gear_materials[g]].safety_factor 
+                for g in gear_materials
+            ) / len(gear_materials)
         
-        # 综合安全裕度
+        # 综合安全裕度（基于最大应力比）
         safety_margin = 1.0 / max_stress_ratio if max_stress_ratio > 0 else float('inf')
         
         # 生成综合名称
@@ -540,7 +562,7 @@ class StrengthChecker:
             material_key='mixed',
             name=combined_name,
             max_stress=max_sigma_F,
-            allow_stress=min_allow_stress,
+            allow_stress=ref_allow_stress,
             strength_ok=all_suitable,
             sf_ratio_ok=all_suitable,  # 已在各齿轮检查中包含
             suitable=all_suitable,
@@ -550,7 +572,9 @@ class StrengthChecker:
             gear_materials=gear_materials,
             gear_material_names=gear_material_names,
             tip_relief_amounts=relief_amounts,
-            contact_ratios={'stage1': epsilon_gamma1, 'stage2': epsilon_gamma2}
+            contact_ratios={'stage1': epsilon_gamma1, 'stage2': epsilon_gamma2},
+            stress_ratios=stress_ratios,
+            max_stress_ratio_gear=max_stress_ratio_gear
         )
     
     def _get_gear_desc(self, gear_key: str) -> str:

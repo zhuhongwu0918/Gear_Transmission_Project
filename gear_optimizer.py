@@ -22,8 +22,9 @@ from report_generator import print_result
 class GearConfig:
     """齿轮设计配置"""
     # 性能约束
-    motor_torque: float = 0.8      # 电机扭矩 (Nm)
-    output_torque: float = 5.0     # 输出扭矩要求 (Nm)
+    motor_torque: float = 0.7      # 电机扭矩 (Nm)
+    # motor_torque: float = 0.8      # 电机扭矩 (Nm)
+    output_torque: float = 6.0     # 输出扭矩要求 (Nm)
     max_motor_speed: float = 4000  # 电机最大转速 (rpm)
     output_speed: float = 350      # 输出转速 (rpm)
     # 结构约束
@@ -31,13 +32,13 @@ class GearConfig:
     min_clearance: float = 1.0     # D1-D3最小间隙 (mm)
     min_teeth: int = 17            # 最小齿数
     # 扫描范围
-    d1_range: tuple = (15, 30)     # 一级主动轮直径范围
-    d2_range: tuple = (50, 120)    # 一级从动轮直径范围
-    d3_range: tuple = (10, 40)     # 二级主动轮直径范围
+    d1_range: tuple = (20, 35)     # 一级主动轮直径范围（增大以增大D1+D2）
+    d2_range: tuple = (50, 90)     # 一级从动轮直径范围（增大以增大D1+D2）
+    d3_range: tuple = (10, 30)     # 二级主动轮直径范围（减小以降低(MOTOR_D+D3)）
     d4_range: tuple = (30, 80)     # 二级从动轮直径范围
     step: int = 2                  # 扫描步长 (mm)
     # 模数选项
-    # m1_options: tuple = (1.0, 1.2) # 增大模数,增大齿根绝对厚度
+    # m1_options: tuple = (1.0, 1.2) # 增大模数,减少齿数，增大齿根绝对厚度
     # 增大齿数，减小模数（保持直径不变）
     m1_options: tuple = (0.6, 0.8, 1.0)  # 从 0.8 减小
     # 对应齿数增加：z1=34, z2=112（直径仍约 17mm/56mm）
@@ -45,8 +46,8 @@ class GearConfig:
     m2_options: tuple = (0.8, 1.0, 1.5)
     
     # 齿宽系数列表 (常用值: 6, 8, 10, 12, 15)，分别控制两级齿轮厚度
-    width_factors1: tuple = (12, 15, 18)  # 第一级齿宽系数（可以更大，因为第一级扭矩小）
-    width_factors2: tuple = (6, 8, 10)       # 第二级齿宽系数
+    width_factors1: tuple = (8, 10, 12)  # 第一级齿宽系数（可以更大，因为第一级扭矩小）
+    width_factors2: tuple = (8, 10, 12)       # 第二级齿宽系数
     # 混合材质配置 - 可为每个齿轮指定不同材质
     # 可选: 'steel'(钢), 'peek'(PEEK), 'pom'(POM), 'nylon'(尼龙), 'peek_cf30'
     # 默认: 全部用钢
@@ -72,6 +73,12 @@ class GearConfig:
     # True = 硬约束: 所有指定材质必须满足强度要求，否则方案无效
     # False = 软约束: 允许自动切换材质以满足强度 (默认)
     strict_material_check: bool = True  # 设为True启用硬约束模式
+    
+    # 应力比约束模式（控制各齿轮应力与许用应力的比值）
+    # True = 硬约束: 所有齿轮应力比必须 < stress_ratio_limit，否则方案无效
+    # False = 软约束: 仅报告应力比，不强制过滤
+    strict_stress_ratio: bool = True  # 设为True启用应力比硬约束
+    stress_ratio_limit: float = 0.5   # 应力比上限 (默认1.0即100%许用应力,不包含材料安全系数)
     
     # 优化目标
     optimize_mode: str = 'weight'    # 'size'或'weight'
@@ -114,6 +121,8 @@ class GearResult:
     helix_angle1: float = 0.0  # 第一级螺旋角
     helix_angle2: float = 0.0  # 第二级螺旋角
     contact_ratios: Dict[str, float] = None  # 重合度
+    stress_ratios: Dict[str, float] = None  # 各齿轮应力比
+    max_stress_ratio_gear: str = ""  # 最大应力比所在齿轮描述
     
     def __post_init__(self):
         if self.stress_details is None:
@@ -126,6 +135,8 @@ class GearResult:
             self.tip_relief_amounts = {}
         if self.contact_ratios is None:
             self.contact_ratios = {}
+        if self.stress_ratios is None:
+            self.stress_ratios = {}
 
 
 # ==================== 核心优化器 ====================
@@ -201,7 +212,9 @@ class GearOptimizer:
             return None
 
         # 8. 间隙约束
-        if (d1 - d3) < cfg.min_clearance:
+        # 新约束: ((D1+D2)-(motor_diameter+D3)) > min_clearance
+        clearance = (d1 + d2) - (cfg.motor_diameter + d3)
+        if clearance <= cfg.min_clearance:
             if stats:
                 stats['clearance'] += 1
             return None
@@ -273,6 +286,14 @@ class GearOptimizer:
         # 找出最大应力所在齿轮
         max_stress_gear = max(result.stress_details.items(), key=lambda x: x[1])[0]
         
+        # 应力比硬约束检查
+        if cfg.strict_stress_ratio and result.stress_ratios:
+            max_ratio = max(result.stress_ratios.values())
+            if max_ratio > cfg.stress_ratio_limit:
+                if stats:
+                    stats['stress_ratio'] += 1
+                return None  # 应力比超过限制，方案无效
+        
         # 10. 计算重量（各齿轮按实际材质密度计算）
         if result.gear_materials:
             # 混合材质：分别计算各齿轮重量
@@ -321,7 +342,9 @@ class GearOptimizer:
             tip_relief2=cfg.tip_relief2,
             helix_angle1=cfg.helix_angle1,
             helix_angle2=cfg.helix_angle2,
-            contact_ratios=result.contact_ratios
+            contact_ratios=result.contact_ratios,
+            stress_ratios=result.stress_ratios,
+            max_stress_ratio_gear=result.max_stress_ratio_gear
         )
     
     def optimize(self, progress_interval: int = 10000) -> tuple:
@@ -357,6 +380,8 @@ class GearOptimizer:
             print(f"材料校核模式: 硬约束 (必须满足指定材质)")
             print(f"  第一级: z1={cfg.material_z1}, z2={cfg.material_z2}")
             print(f"  第二级: z3={cfg.material_z3}, z4={cfg.material_z4}")
+        if cfg.strict_stress_ratio:
+            print(f"应力比约束: 硬约束 (最大应力比 < {cfg.stress_ratio_limit:.2f})")
         print()
         
         best_result = None
@@ -374,6 +399,7 @@ class GearOptimizer:
             'clearance': 0,    # 间隙约束
             'material': 0,     # 材料强度
             'strict_mat': 0,   # 硬约束材质
+            'stress_ratio': 0, # 应力比超限
         }
         
         # 搜索
@@ -413,7 +439,7 @@ class GearOptimizer:
         print()  # 换行
 
         # 打印失败统计（仅在硬约束模式或调试时显示）
-        if cfg.strict_material_check or sum(failure_stats.values()) > 0:
+        if cfg.strict_material_check or cfg.strict_stress_ratio or sum(failure_stats.values()) > 0:
             print("\n【约束失败统计】")
             total_failures = sum(failure_stats.values())
             if total_failures > 0:
@@ -425,6 +451,8 @@ class GearOptimizer:
                 print(f"  材料强度:  {failure_stats['material']:,} ({failure_stats['material']/total_failures*100:.1f}%)")
                 if cfg.strict_material_check:
                     print(f"  硬约束材质不满足: {failure_stats['strict_mat']:,} ({failure_stats['strict_mat']/total_failures*100:.1f}%)")
+                if cfg.strict_stress_ratio:
+                    print(f"  应力比超限(>{cfg.stress_ratio_limit}): {failure_stats['stress_ratio']:,} ({failure_stats['stress_ratio']/total_failures*100:.1f}%)")
             else:
                 print("  所有方案均通过约束检查")
 
