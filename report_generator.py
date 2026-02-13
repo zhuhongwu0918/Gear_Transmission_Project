@@ -143,9 +143,32 @@ class ReportGenerator:
     
     def _print_header(self):
         """打印报告头部"""
+        c = self.config
+        
         print(f"\n╔{self.hline}╗")
         print(f"║{'两级齿轮传动优化设计报告':^58}║")
         print(f"╚{self.hline}╝")
+        
+        # 电机参数
+        print(f"\n┌{'─' * 54}┐")
+        print(f"│ {'电机参数':^52} │")
+        print(f"├{self.hline_blue}┤")
+        print(f"│ 电机扭矩: {c.motor_torque} N·m")
+        print(f"│ 电机最大转速: {c.max_motor_speed} rpm")
+        print(f"│ 电机直径: {c.motor_diameter} mm")
+        print(f"│ 电机重量: {c.motor_weight} g")
+        print(f"└{'─' * 54}┘")
+        
+        # 目标输出性能
+        print(f"\n┌{'─' * 54}┐")
+        print(f"│ {'目标输出性能':^52} │")
+        print(f"├{self.hline_blue}┤")
+        print(f"│ 输出扭矩要求: ≥ {c.output_torque} N·m")
+        print(f"│ 输出转速要求: {c.output_speed} rpm")
+        required_ratio = c.output_torque / c.motor_torque / 0.9025
+        max_ratio = c.max_motor_speed / c.output_speed
+        print(f"│ 所需传动比: {required_ratio:.2f} ~ {max_ratio:.2f}")
+        print(f"└{'─' * 54}┘")
         
         opt_target = "纵向尺寸最短" if self.config.optimize_mode == 'size' else "重量最轻"
         print(f"\n▶ 【优化目标】{opt_target}")

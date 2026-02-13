@@ -29,6 +29,7 @@ class GearConfig:
     output_speed: float = 350      # 输出转速 (rpm)
     # 结构约束
     motor_diameter: float = 75     # 电机直径 (mm)
+    motor_thickness: float = 17     # 电机厚度 (mm)
     min_clearance: float = 1.0     # D1-D3最小间隙 (mm)
     min_teeth: int = 17            # 最小齿数
     # 扫描范围
