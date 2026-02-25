@@ -55,7 +55,8 @@ class GearConfig:
     # === 方案A: 第一级从动轮用塑料降噪 ===
     material_z1: str = 'steel'  # 第一级主动轮
     material_z2: str = 'peek_cf30'    # 第一级从动轮  <- 'pom'或'nylon'降噪，'peek_cf30'高强度
-    material_z3: str = 'steel'  # 第二级主动轮
+    # material_z3: str = 'steel'  # 第二级主动轮
+    material_z3: str = 'peek_cf30'  # 第二级主动轮
     material_z4: str = 'steel'  # 第二级从动轮
     
     # 齿顶修缘参数（降低啮合冲击噪音）
